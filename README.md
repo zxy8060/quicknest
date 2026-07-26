@@ -1,68 +1,137 @@
 # QuickNest 轻启
 
-一个轻量、离线、面向 Windows 的桌面快速启动面板。交互思路参考 Lucy、Lily、Maye 等图标式启动器，但代码从零实现并以 MIT 许可证发布。
+QuickNest 是一个轻量、离线、面向 Windows 的桌面快速启动器。它使用 Tauri 2、Vue 3 和 Rust 构建，支持两级分组、全局快捷键、注册表应用汇总、目标失效检测和本地 JSON 存储。
 
-## 已实现
+> 当前版本：`0.4.1` · 平台：Windows 10/11 · 许可证：[MIT](LICENSE)
 
-- 用可折叠的二级分组整理应用、文件、文件夹和网址
-- 文件拖拽添加与 Windows 系统图标提取
-- 跨分组搜索名称、路径和备注
-- 自动汇总 Windows 注册表中的可启动应用（64 位、32 位及当前用户）
-- 后台检测目标文件是否存在，失效快捷项自动标红
-- 可批量清理当前页面内的失效快捷项，逐项默认勾选并经过二次确认
-- 记住最后浏览的一级、二级或系统板块，重启后自动恢复
-- 收藏、编辑、移动、移除快捷项
-- 录制式全局快捷键设置，默认 `Ctrl+Shift+Space`
-- 启动后自动隐藏、失焦隐藏与窗口钉住
-- 系统托盘驻留，关闭主窗口不会退出
-- 可选开机自启动
-- 深色/浅色主题、透明度和图标尺寸调节
-- 所有数据保存在本机 JSON 文件中，不联网、不写业务数据到注册表
+## 特性
 
-## 使用
+- 一级标签位于顶部，二级标签位于左侧；点击一级标签自动进入其首个二级标签
+- “全部项目”汇总所有自定义快捷项，“全部 ××”汇总当前一级分组及其二级分组
+- 添加应用、文件、文件夹和 URL，支持拖拽导入与 Windows 原生图标提取
+- 按名称、目标路径和备注跨分组搜索
+- 读取 Windows 注册表中的可启动应用，不将注册表项目写入用户数据
+- 后台异步检查目标是否存在，失效项目自动标红
+- 批量清理当前页面或当前搜索结果内的失效快捷项
+  - 第一层弹窗逐项复选，默认全部勾选
+  - 第二层弹窗再次展示最终清单
+  - 只移除 QuickNest 记录，不删除原程序或文件
+- 收藏、编辑、移动和删除自定义快捷项
+- 录制式全局快捷键；支持 `Shift+Q` 等带修饰键的组合
+- 记住关闭前所在的系统页面、一级分组和二级分组
+- 托盘驻留、启动后隐藏、失焦隐藏、窗口钉住和开机启动
+- 深色/浅色主题、透明度及 `20–64px` 图标尺寸调节
 
-1. 安装并启动 QuickNest。
-2. 把程序、文件或文件夹直接拖进窗口，或点击“添加项目”。
-3. 右键启动项可编辑、收藏、定位原文件或移除。
-4. 顶部切换一级分组，左侧选择该一级下的二级分组；点击一级分组可汇总查看其全部子分组。
-5. 左侧“已安装应用”会自动扫描注册表，可随时点击“刷新注册表”更新。
-6. 双击分组名可重命名；右键分组可删除。
-7. 按 `Ctrl+Shift+Space` 在任何界面唤起或隐藏。
+## 安装与使用
 
-数据默认位于：
+### 使用预构建版本
+
+项目构建会生成：
+
+- 便携版：`src-tauri/target/release/quicknest.exe`
+- NSIS 安装包：`src-tauri/target/release/bundle/nsis/QuickNest_<version>_x64-setup.exe`
+
+当前仓库未配置代码签名，Windows SmartScreen 可能显示“未知发布者”。
+
+### 基本操作
+
+1. 启动 QuickNest。
+2. 将程序、文件或文件夹拖入窗口，或点击“添加项目”。
+3. 顶部切换一级分组，左侧选择二级分组。
+4. 右键快捷项可编辑、收藏、定位目标或移除。
+5. 打开“设置”，点击“录制”后直接按下新的全局快捷键，最后点击“应用并保存”。
+6. 按住窗口顶部拖动区域可移动窗口；按 `Ctrl + 滚轮` 可调整图标尺寸。
+
+批量清理只处理当前页面中已经检测为失效的自定义快捷项。注册表应用是只读汇总，不会出现在清理清单中。
+
+## 本地数据与隐私
+
+QuickNest 不需要账号，不上传启动数据。用户配置默认位于：
 
 ```text
 %APPDATA%\com.quicknest.launcher\launcher.json
 ```
 
+图标以 Base64 data URI 保存在同一个 JSON 中，因此数据文件可能较大。可从设置页直接打开数据目录并备份 `launcher.json`。
+
+请勿把真实 `launcher.json`、本机构建产物或迁移备份提交到仓库。详细字段说明见 [数据模型](docs/DATA_MODEL.md)。
+
 ## 本地开发
 
-需要 Node.js、pnpm、Rust 和 Windows WebView2：
+### 环境要求
+
+- Windows 10/11
+- Node.js 20 或更高版本
+- pnpm
+- Rust stable 与 Cargo
+- Visual Studio C++ Build Tools
+- Microsoft Edge WebView2 Runtime
+
+### 启动开发环境
 
 ```powershell
 pnpm install
 pnpm tauri dev
 ```
 
-生成 NSIS 安装包：
+只启动 Web 前端：
 
 ```powershell
+pnpm dev
+```
+
+### 检查与构建
+
+```powershell
+pnpm build
+cargo check --manifest-path .\src-tauri\Cargo.toml
 pnpm tauri build
 ```
 
-## 设计取舍
+`pnpm build` 同时运行 Vue/TypeScript 类型检查和 Vite 生产构建。
 
-- 使用 Tauri 2 + Vue 3，减少常驻资源占用并保留原生托盘、热键和图标能力。
-- 使用可读、可直接备份的 JSON；当前已支持迁移 Lucy 的父子分组、启动项、图标、备注、参数和启动次数。
-- 不复制 `my-quickstart` 的代码：该仓库在调研时没有许可证，无法确认再分发授权。
-- 没有基于 GeekDesk 直接改造：它虽然采用 Apache-2.0，但技术栈是 .NET Framework 4.7.2，升级和裁剪成本高于干净实现。
+## 项目结构
+
+```text
+.
+├─ src/
+│  ├─ App.vue                    # 主界面、导航和交互编排
+│  ├─ launcher.ts                # 响应式状态及快捷项 CRUD
+│  ├─ types.ts                   # 持久化数据类型和默认状态
+│  ├─ styles.css                 # 全局界面样式
+│  └─ components/
+│     ├─ ItemEditor.vue          # 快捷项编辑器
+│     └─ SettingsPanel.vue       # 设置与快捷键录制
+├─ src-tauri/
+│  ├─ src/lib.rs                 # Tauri 命令、托盘、热键及 Windows 集成
+│  ├─ capabilities/default.json  # WebView 权限白名单
+│  └─ tauri.conf.json            # 窗口和打包配置
+├─ docs/                         # 架构、数据模型及开发说明
+├─ AGENTS.md                     # AI/自动化代理的仓库操作约束
+└─ CONTRIBUTING.md               # 贡献流程
+```
+
+## 文档
+
+- [架构说明](docs/ARCHITECTURE.md)
+- [数据模型与兼容性](docs/DATA_MODEL.md)
+- [开发、验证与发布](docs/DEVELOPMENT.md)
+- [故障排查](docs/TROUBLESHOOTING.md)
+- [贡献指南](CONTRIBUTING.md)
+- [安全说明](SECURITY.md)
+- [版本记录](CHANGELOG.md)
+- [AI 代理指南](AGENTS.md)
 
 ## 当前边界
 
-- 主要面向 Windows 10/11。
-- 贴边自动隐藏、便签页和启动项拖拽排序尚未加入。
-- 首版未做代码签名，Windows SmartScreen 可能显示未知发布者提示。
+- 桌面能力主要针对 Windows 实现。
+- 分组结构固定为一级与二级，不支持任意深度嵌套。
+- 注册表应用是运行时扫描结果，不能直接编辑、收藏或批量移除。
+- 贴边自动隐藏、快捷项拖拽排序和在线同步尚未实现。
+- 当前保存方式是本地 JSON 覆盖写入；修改持久化逻辑时应优先考虑原子写入和备份策略。
 
-## License
+## 设计来源与许可
 
-MIT
+交互思路参考 Lucy、Lily、Maye 等图标式启动器，但代码从零实现。项目未复制无明确许可证的第三方启动器代码。
+
+QuickNest 采用 [MIT License](LICENSE)。
