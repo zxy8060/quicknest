@@ -47,8 +47,9 @@ Rust / Tauri
 负责持久化状态的内存模型和 CRUD：
 
 - `loadLauncher` 加载数据并执行兼容性修正；
+- `migrateLauncherState` 校验并迁移旧版本数据；
 - `scheduleSave` 合并短时间内的多次保存请求；
-- `saveLauncher` 调用 Rust 写入 JSON；
+- 保存队列串行化快照，`flushLauncher` 在退出前等待落盘；
 - 文件导入、分组增删、快捷项移动和批量移除；
 - 图标补全。
 
@@ -64,13 +65,14 @@ Rust / Tauri
 | 命令 | 作用 |
 | --- | --- |
 | `load_state` | 读取并解析 `launcher.json` |
-| `save_state` | 格式化并写入 `launcher.json` |
+| `save_state` | 同步写入临时文件、更新备份并原子替换 `launcher.json` |
 | `icon_for_path` | 提取系统图标并返回 PNG data URI |
 | `registry_apps` | 扫描 Windows App Paths 与 Uninstall 注册项 |
 | `launch_target` | 启动可执行文件或交给系统 opener |
 | `reveal_target` | 在资源管理器中定位目标 |
 | `open_data_folder` | 打开用户数据目录 |
 | `hide_window` | 隐藏主窗口 |
+| `quit_app` | 前端完成保存队列 flush 后退出进程 |
 | `hotkey_diagnostics` | 返回快捷键触发次数和窗口可见状态 |
 | `check_targets` | 在阻塞线程池中批量检查目标是否存在 |
 
@@ -97,9 +99,10 @@ Windows 实现扫描：
 
 ## 窗口与托盘
 
+- 单实例插件阻止多个进程争抢快捷键或并发写入配置；再次启动会唤起已有窗口。
 - 主窗口无系统装饰、透明、带阴影。
 - 关闭请求会被拦截并改为隐藏。
-- 托盘左键显示窗口，菜单提供“显示”和“退出”。
+- 托盘左键显示窗口，菜单提供“显示”和“退出”；退出请求会先等待前端保存队列。
 - 开机启动使用 `--hidden` 参数。
 
 ## 权限

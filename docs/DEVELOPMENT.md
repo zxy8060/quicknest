@@ -35,12 +35,24 @@ pnpm dev
 
 Vite 开发地址由 Tauri 配置为 `http://localhost:1420`。
 
+### 隔离测试数据
+
+桌面回归测试不得使用真实 `launcher.json`。启动测试实例前设置专用目录：
+
+```powershell
+$env:QUICKNEST_DATA_DIR = "C:\path\to\isolated-quicknest-data"
+pnpm tauri dev
+```
+
+该环境变量只改变 QuickNest 配置目录，不改变注册表扫描范围。测试结束后清除变量。
+
 ## 常用检查
 
 前端类型检查与生产构建：
 
 ```powershell
 pnpm build
+pnpm test
 ```
 
 Rust 检查：
@@ -64,7 +76,10 @@ cargo test --manifest-path .\src-tauri\Cargo.toml
 1. 使用 `packageManager` 字段安装锁定的 pnpm 版本；
 2. `pnpm install --frozen-lockfile`；
 3. `pnpm build`；
-4. `cargo check --locked`。
+4. `pnpm test`；
+5. `cargo fmt --check`；
+6. Clippy（warnings as errors）；
+7. `cargo test --locked`。
 
 CI 权限只有 `contents: read`，不发布包、不使用仓库密钥。
 
@@ -119,7 +134,12 @@ pnpm tauri build
 - 取消清理不会修改数据。
 - 删除快捷项不会删除目标文件。
 - 重启后恢复上次所在页面。
+- 再次启动程序只会唤起现有实例。
+- 快捷键唤起后搜索框获得焦点，方向键与回车可以选择并启动项目。
+- “最近使用”按最后启动时间排列。
+- 批量操作只作用于当前页面/搜索结果中的自定义快捷项。
+- 模拟损坏主 JSON 时能从 `launcher.json.bak` 恢复。
 
 ## 数据安全
 
-开发和手工测试默认会访问当前用户的真实应用数据目录。需要破坏性测试时，应使用隔离的 Windows 用户或隔离的 `APPDATA` 环境，不要拿真实 `launcher.json` 做删除测试。
+开发和手工测试默认会访问当前用户的真实应用数据目录。桌面回归应设置 `QUICKNEST_DATA_DIR`；需要更完整的系统隔离时使用独立 Windows 用户。不要拿真实 `launcher.json` 做删除测试。

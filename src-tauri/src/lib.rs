@@ -2,7 +2,8 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::Serialize;
 use std::{
     collections::HashMap,
-    fs,
+    fs::{self, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
     process::Command,
     sync::atomic::{AtomicUsize, Ordering},
@@ -10,17 +11,18 @@ use std::{
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Manager, WindowEvent,
+    AppHandle, Emitter, Manager, WindowEvent,
 };
 
 #[cfg(target_os = "windows")]
-use std::os::windows::process::CommandExt;
+use std::os::windows::{ffi::OsStrExt, process::CommandExt};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::Storage::FileSystem::{
+    MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+};
 #[cfg(target_os = "windows")]
 use winreg::{
-    enums::{
-        HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_32KEY,
-        KEY_WOW64_64KEY,
-    },
+    enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_32KEY, KEY_WOW64_64KEY},
     RegKey,
 };
 
@@ -28,31 +30,140 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 static HOTKEY_TRIGGER_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 fn state_path(app: &AppHandle) -> Result<PathBuf, String> {
-    let dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| error.to_string())?;
+    let dir = if let Some(override_dir) = std::env::var_os("QUICKNEST_DATA_DIR") {
+        PathBuf::from(override_dir)
+    } else {
+        app.path()
+            .app_data_dir()
+            .map_err(|error| error.to_string())?
+    };
     fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
     Ok(dir.join("launcher.json"))
 }
 
-#[tauri::command]
-fn load_state(app: AppHandle) -> Result<Option<serde_json::Value>, String> {
-    let path = state_path(&app)?;
-    if !path.exists() {
-        return Ok(None);
-    }
+fn sibling_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(suffix);
+    path.with_file_name(name)
+}
+
+fn backup_path(path: &Path) -> PathBuf {
+    sibling_with_suffix(path, ".bak")
+}
+
+fn read_json(path: &Path) -> Result<serde_json::Value, String> {
     let content = fs::read_to_string(path).map_err(|error| error.to_string())?;
-    serde_json::from_str(&content)
-        .map(Some)
-        .map_err(|error| format!("启动数据损坏：{error}"))
+    serde_json::from_str(&content).map_err(|error| error.to_string())
+}
+
+fn write_synced(path: &Path, content: &[u8]) -> Result<(), String> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| error.to_string())?;
+    file.write_all(content).map_err(|error| error.to_string())?;
+    file.sync_all().map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn replace_file(source: &Path, destination: &Path) -> Result<(), String> {
+    let source_wide: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination_wide: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let result = unsafe {
+        MoveFileExW(
+            source_wide.as_ptr(),
+            destination_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(std::io::Error::last_os_error().to_string())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn replace_file(source: &Path, destination: &Path) -> Result<(), String> {
+    fs::rename(source, destination).map_err(|error| error.to_string())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LoadStateResponse {
+    state: Option<serde_json::Value>,
+    recovered_from_backup: bool,
+}
+
+#[tauri::command]
+fn load_state(app: AppHandle) -> Result<LoadStateResponse, String> {
+    let path = state_path(&app)?;
+    let backup = backup_path(&path);
+    if !path.exists() {
+        if backup.exists() {
+            return read_json(&backup)
+                .map(|state| LoadStateResponse {
+                    state: Some(state),
+                    recovered_from_backup: true,
+                })
+                .map_err(|error| format!("主数据不存在，备份也无法读取：{error}"));
+        }
+        return Ok(LoadStateResponse {
+            state: None,
+            recovered_from_backup: false,
+        });
+    }
+    match read_json(&path) {
+        Ok(state) => Ok(LoadStateResponse {
+            state: Some(state),
+            recovered_from_backup: false,
+        }),
+        Err(primary_error) if backup.exists() => read_json(&backup)
+            .map(|state| LoadStateResponse {
+                state: Some(state),
+                recovered_from_backup: true,
+            })
+            .map_err(|backup_error| {
+                format!("启动数据损坏：{primary_error}；备份也无法读取：{backup_error}")
+            }),
+        Err(error) => Err(format!("启动数据损坏，且没有可用备份：{error}")),
+    }
 }
 
 #[tauri::command]
 fn save_state(app: AppHandle, state: serde_json::Value) -> Result<(), String> {
     let path = state_path(&app)?;
     let content = serde_json::to_string_pretty(&state).map_err(|error| error.to_string())?;
-    fs::write(path, content).map_err(|error| error.to_string())
+    let temporary = sibling_with_suffix(&path, ".tmp");
+    let backup = backup_path(&path);
+    let backup_temporary = sibling_with_suffix(&backup, ".tmp");
+
+    write_synced(&temporary, content.as_bytes())?;
+
+    if path.exists() {
+        if let Ok(previous) = fs::read(&path) {
+            if serde_json::from_slice::<serde_json::Value>(&previous).is_ok() {
+                write_synced(&backup_temporary, &previous)?;
+                if let Err(error) = replace_file(&backup_temporary, &backup) {
+                    let _ = fs::remove_file(&backup_temporary);
+                    let _ = fs::remove_file(&temporary);
+                    return Err(format!("无法更新数据备份：{error}"));
+                }
+            }
+        }
+    }
+
+    if let Err(error) = replace_file(&temporary, &path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(format!("无法安全写入启动数据：{error}"));
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -150,11 +261,7 @@ fn add_registry_app(
 }
 
 #[cfg(target_os = "windows")]
-fn collect_app_paths(
-    hive: &RegKey,
-    view: u32,
-    apps: &mut HashMap<String, RegistryApp>,
-) {
+fn collect_app_paths(hive: &RegKey, view: u32, apps: &mut HashMap<String, RegistryApp>) {
     let Ok(root) = hive.open_subkey_with_flags(
         r"Software\Microsoft\Windows\CurrentVersion\App Paths",
         KEY_READ | view,
@@ -187,11 +294,7 @@ fn collect_app_paths(
 }
 
 #[cfg(target_os = "windows")]
-fn collect_uninstall_entries(
-    hive: &RegKey,
-    view: u32,
-    apps: &mut HashMap<String, RegistryApp>,
-) {
+fn collect_uninstall_entries(hive: &RegKey, view: u32, apps: &mut HashMap<String, RegistryApp>) {
     let Ok(root) = hive.open_subkey_with_flags(
         r"Software\Microsoft\Windows\CurrentVersion\Uninstall",
         KEY_READ | view,
@@ -240,11 +343,7 @@ fn registry_apps() -> Result<Vec<RegistryApp>, String> {
             }
         }
         let mut result: Vec<_> = apps.into_values().collect();
-        result.sort_by(|left, right| {
-            left.title
-                .to_lowercase()
-                .cmp(&right.title.to_lowercase())
-        });
+        result.sort_by_key(|entry| entry.title.to_lowercase());
         for (index, app) in result.iter_mut().enumerate() {
             app.id = format!("registry-{index}");
         }
@@ -340,6 +439,11 @@ fn hide_window(app: AppHandle) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+#[tauri::command]
+fn quit_app(app: AppHandle) {
+    app.exit(0);
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct HotkeyDiagnostics {
@@ -364,19 +468,14 @@ fn target_exists(target: &str) -> bool {
         return false;
     }
     let bytes = value.as_bytes();
-    let is_drive_path = bytes.len() >= 3
-        && bytes[1] == b':'
-        && (bytes[2] == b'\\' || bytes[2] == b'/');
+    let is_drive_path =
+        bytes.len() >= 3 && bytes[1] == b':' && (bytes[2] == b'\\' || bytes[2] == b'/');
     let is_unc_path = value.starts_with(r"\\");
     let is_protocol = !is_drive_path
         && !is_unc_path
-        && value
-            .find(':')
-            .is_some_and(|index| {
-                index > 0
-                    && !value[..index].contains('\\')
-                    && !value[..index].contains('/')
-            });
+        && value.find(':').is_some_and(|index| {
+            index > 0 && !value[..index].contains('\\') && !value[..index].contains('/')
+        });
     is_protocol || Path::new(value).exists()
 }
 
@@ -400,19 +499,21 @@ fn show_main(app: &AppHandle) {
         let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
+        let _ = window.emit("quicknest://focus-search", ());
     }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            show_main(app);
+        }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, _shortcut, event| {
-                    if event.state
-                        != tauri_plugin_global_shortcut::ShortcutState::Pressed
-                    {
+                    if event.state != tauri_plugin_global_shortcut::ShortcutState::Pressed {
                         return;
                     }
                     HOTKEY_TRIGGER_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -445,7 +546,9 @@ pub fn run() {
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "show" => show_main(app),
-                    "quit" => app.exit(0),
+                    "quit" => {
+                        let _ = app.emit("quicknest://request-quit", ());
+                    }
                     _ => {}
                 })
                 .on_tray_icon_event(|tray, event| {
@@ -482,6 +585,7 @@ pub fn run() {
             reveal_target,
             open_data_folder,
             hide_window,
+            quit_app,
             hotkey_diagnostics,
             check_targets
         ])
@@ -491,12 +595,72 @@ pub fn run() {
 
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
-    use super::registry_apps;
+    use super::{registry_apps, replace_file, write_synced};
+    use std::{
+        fs, process,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     #[test]
     fn registry_scan_finds_launchable_apps() {
         let apps = registry_apps().expect("registry scan should succeed");
-        assert!(!apps.is_empty(), "registry scan returned no launchable apps");
+        assert!(
+            !apps.is_empty(),
+            "registry scan returned no launchable apps"
+        );
         eprintln!("registry apps found: {}", apps.len());
+    }
+
+    #[test]
+    fn atomic_replace_overwrites_existing_content() {
+        let directory = std::env::temp_dir().join(format!(
+            "quicknest-atomic-test-{}-{}",
+            process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).expect("create test directory");
+        let source = directory.join("launcher.json.tmp");
+        let destination = directory.join("launcher.json");
+        write_synced(&destination, b"{\"version\":1}").expect("write old state");
+        write_synced(&source, b"{\"version\":6}").expect("write new state");
+
+        replace_file(&source, &destination).expect("replace state");
+
+        assert_eq!(
+            fs::read_to_string(&destination).expect("read replaced state"),
+            "{\"version\":6}"
+        );
+        assert!(!source.exists());
+        fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn atomic_replace_creates_new_destination() {
+        let directory = std::env::temp_dir().join(format!(
+            "quicknest-atomic-create-test-{}-{}",
+            process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).expect("create test directory");
+        let source = directory.join("launcher.json.tmp");
+        let destination = directory.join("launcher.json");
+        write_synced(&source, b"{\"version\":6}").expect("write new state");
+
+        replace_file(&source, &destination).expect("create state");
+
+        assert_eq!(
+            fs::read_to_string(&destination).expect("read created state"),
+            "{\"version\":6}"
+        );
+        assert!(!source.exists());
+        fs::remove_dir_all(&directory).expect("remove test directory");
     }
 }

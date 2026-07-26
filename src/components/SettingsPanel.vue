@@ -1,11 +1,11 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
-import { enable, disable, isEnabled } from "@tauri-apps/plugin-autostart";
+import { isEnabled } from "@tauri-apps/plugin-autostart";
 import { invoke } from "@tauri-apps/api/core";
 import { Database, Keyboard, X } from "lucide-vue-next";
 import type { LauncherSettings } from "../types";
 
-const props = defineProps<{ settings: LauncherSettings }>();
+const props = defineProps<{ settings: LauncherSettings; saving?: boolean }>();
 const emit = defineEmits<{ close: []; save: [settings: LauncherSettings] }>();
 const form = ref({ ...props.settings });
 const recording = ref(false);
@@ -108,14 +108,9 @@ function normalizedKey(event: KeyboardEvent) {
   return keys[event.code] ?? "";
 }
 
-async function save() {
+function save() {
   stopRecording();
-  try {
-    if (form.value.startOnBoot) await enable();
-    else await disable();
-  } finally {
-    emit("save", { ...form.value });
-  }
+  emit("save", { ...form.value });
 }
 </script>
 
@@ -188,7 +183,9 @@ async function save() {
 
       <footer class="modal-actions right">
         <button class="secondary-button" @click="emit('close')">取消</button>
-        <button class="primary-button" @click="save">应用并保存</button>
+        <button class="primary-button" :disabled="saving" @click="save">
+          {{ saving ? "正在保存…" : "应用并保存" }}
+        </button>
       </footer>
     </section>
   </div>

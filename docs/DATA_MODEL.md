@@ -8,6 +8,14 @@
 
 Rust 通过 Tauri 的 `app_data_dir()` 解析目录。该文件包含个人应用路径、备注和图标，不应提交或公开分享。
 
+持久化使用同目录临时文件和原子替换。上一份可解析的数据保存在：
+
+```text
+%APPDATA%\com.quicknest.launcher\launcher.json.bak
+```
+
+主文件无法解析时会自动加载备份，并用迁移后的有效状态重建主文件。
+
 ## 顶层结构
 
 当前 schema 版本是 `6`：
@@ -113,13 +121,21 @@ Rust 通过 Tauri 的 `app_data_dir()` 解析目录。该文件包含个人应�
 
 ## 迁移规则
 
+`src/migrations.ts` 是加载边界。它会：
+
+- 拒绝高于当前应用支持版本的数据，避免旧版应用覆盖新版数据；
+- 为旧数据补齐字段和默认设置；
+- 修正重复 ID、孤儿分组和超过两级的父子关系；
+- 约束主题、图标尺寸、透明度和最后浏览位置；
+- 保留可识别的用户快捷项，不因缺少新字段而丢弃记录。
+
 修改 schema 时：
 
 1. 在 `src/types.ts` 更新接口和 `DEFAULT_STATE`。
 2. 增加 `LauncherState.version`。
-3. 在 `loadLauncher()` 中兼容缺失字段或旧值。
+3. 在 `migrateLauncherState()` 中增加明确迁移和兼容规则。
 4. 不要假设旧 `settings` 包含新增属性。
-5. 用不含真实路径和隐私数据的 fixture 验证迁移。
+5. 用不含真实路径和隐私数据的 fixture 验证迁移，并运行 `pnpm test`。
 6. 更新本文档和 `CHANGELOG.md`。
 
 应用版本与 schema 版本独立；发布新应用版本不一定需要升级 schema。

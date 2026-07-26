@@ -1,16 +1,20 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
+import { disable, enable, isEnabled } from "@tauri-apps/plugin-autostart";
 import {
   register,
   unregisterAll,
 } from "@tauri-apps/plugin-global-shortcut";
 import {
   AppWindow,
+  Check,
   ChevronDown,
+  Clock3,
   File,
   Folder,
   FolderOpen,
@@ -18,6 +22,7 @@ import {
   GripHorizontal,
   GripVertical,
   Heart,
+  ListChecks,
   Minus,
   MoreHorizontal,
   PackageOpen,
@@ -38,17 +43,26 @@ import SettingsPanel from "./components/SettingsPanel.vue";
 import {
   addNestedGroup,
   addPaths,
+  flushLauncher,
   hydrateIcons,
   launcher,
   loadLauncher,
+  moveItems,
   removeGroup,
   removeItem,
   removeItems,
   saveLauncher,
   scheduleSave,
+  setItemsFavorite,
+  setPersistenceErrorHandler,
   updateItem,
 } from "./launcher";
-import type { LauncherGroup, LauncherItem, LauncherSettings } from "./types";
+import {
+  plainClone,
+  type LauncherGroup,
+  type LauncherItem,
+  type LauncherSettings,
+} from "./types";
 import "./styles.css";
 
 type ViewId = "all" | "favorites" | string;
@@ -62,6 +76,10 @@ type CleanupCandidate = {
   groupName: string;
   checked: boolean;
 };
+type ItemSelection = {
+  groupId: string;
+  itemId: string;
+};
 
 const currentView = ref<ViewId>("all");
 const query = ref("");
@@ -71,11 +89,19 @@ const pinned = ref(false);
 const selectedRootId = ref("");
 const registryItems = ref<LauncherItem[]>([]);
 const registryLoading = ref(false);
+const registryLoaded = ref(false);
 const hotkeyTriggerCount = ref(0);
 const missingTargets = ref<Set<string>>(new Set());
 const targetCheckInProgress = ref(false);
 const itemEditor = ref<{ item?: LauncherItem; groupId: string }>();
 const settingsOpen = ref(false);
+const settingsSaving = ref(false);
+const searchInput = ref<HTMLInputElement>();
+const activeItemIndex = ref(-1);
+const batchMode = ref(false);
+const batchSelection = ref<Set<string>>(new Set());
+const batchDestinationGroupId = ref("");
+const batchDeleteConfirmOpen = ref(false);
 const cleanupStage = ref<"select" | "confirm" | null>(null);
 const cleanupCandidates = ref<CleanupCandidate[]>([]);
 const contextMenu = ref<{
@@ -88,6 +114,8 @@ const toast = ref("");
 let toastTimer: number | undefined;
 let unlistenDrop: (() => void) | undefined;
 let unlistenFocus: (() => void) | undefined;
+let unlistenFocusSearch: (() => void) | undefined;
+let unlistenQuitRequest: (() => void) | undefined;
 let activeHotkey = "";
 let targetCheckTimer: number | undefined;
 let lastTargetCheck = 0;
@@ -114,6 +142,21 @@ const registryGroup = computed<LauncherGroup>(() => ({
   items: registryItems.value,
 }));
 
+const orderedGroups = computed(() =>
+  rootGroups.value.flatMap((parent) => [
+    parent,
+    ...launcher.groups.filter((group) => group.parentId === parent.id),
+  ]),
+);
+
+const recentCount = computed(() =>
+  launcher.groups.reduce(
+    (count, group) =>
+      count + group.items.filter((item) => Boolean(item.lastLaunched)).length,
+    0,
+  ),
+);
+
 function childGroups(parentId: string) {
   return launcher.groups.filter((group) => group.parentId === parentId);
 }
@@ -135,11 +178,32 @@ function groupPath(group: LauncherGroup) {
 
 const visibleEntries = computed(() => {
   const normalized = query.value.trim().toLocaleLowerCase();
+  const customEntries = launcher.groups.flatMap((group) =>
+    group.items.map((item) => ({ item, group })),
+  );
   const source =
-    currentView.value === "all"
-      ? launcher.groups.flatMap((group) =>
-          group.items.map((item) => ({ item, group })),
-        )
+    normalized
+      ? [
+          ...customEntries,
+          ...registryItems.value.map((item) => ({
+            item,
+            group: registryGroup.value,
+          })),
+        ]
+      : currentView.value === "all"
+        ? customEntries
+      : currentView.value === "recent"
+        ? launcher.groups
+            .flatMap((group) =>
+              group.items
+                .filter((item) => Boolean(item.lastLaunched))
+                .map((item) => ({ item, group })),
+            )
+            .sort(
+              (left, right) =>
+                (right.item.lastLaunched ?? 0) - (left.item.lastLaunched ?? 0)
+                || right.item.launchCount - left.item.launchCount,
+            )
       : currentView.value === "registry"
         ? registryItems.value.map((item) => ({
             item,
@@ -174,8 +238,21 @@ const selectedCleanupCandidates = computed(() =>
   cleanupCandidates.value.filter((candidate) => candidate.checked),
 );
 
+const visibleBatchEntries = computed(() =>
+  visibleEntries.value.filter(({ item }) => !isRegistryItem(item)),
+);
+
+const batchSelectedEntries = computed(() =>
+  launcher.groups.flatMap((group) =>
+    group.items
+      .filter((item) => batchSelection.value.has(itemSelectionKey(group.id, item.id)))
+      .map((item) => ({ item, group })),
+  ),
+);
+
 const viewTitle = computed(() => {
   if (currentView.value === "all") return "全部项目";
+  if (currentView.value === "recent") return "最近使用";
   if (currentView.value === "registry") return "已安装应用";
   if (currentView.value === "favorites") return "我的收藏";
   return activeGroup.value ? groupPath(activeGroup.value) : "启动项";
@@ -196,23 +273,38 @@ watch([currentView, selectedRootId], ([viewId, rootId]) => {
   scheduleSave();
 });
 
+watch([currentView, query], () => {
+  activeItemIndex.value = -1;
+  if (batchMode.value) exitBatchMode();
+});
+
+watch(currentView, (viewId) => {
+  if (viewId === "registry" && !registryLoaded.value) {
+    void loadRegistryApps();
+  }
+});
+
 onMounted(async () => {
+  setPersistenceErrorHandler(() => {
+    notify("保存失败，请检查数据目录权限或磁盘空间");
+  });
   try {
-    await loadLauncher();
+    unlistenFocusSearch = await listen("quicknest://focus-search", () => {
+      focusSearch();
+    });
+    unlistenQuitRequest = await listen("quicknest://request-quit", async () => {
+      try {
+        await flushLauncher();
+        await invoke("quit_app");
+      } catch {
+        notify("数据尚未保存，已取消退出");
+      }
+    });
+
+    const loadResult = await loadLauncher();
     restoreNavigation();
-    await loadRegistryApps();
-    void refreshTargetHealth();
-    targetCheckTimer = window.setInterval(() => {
-      void refreshTargetHealth();
-    }, 60_000);
-    await hydrateIcons();
-    scheduleSave();
-    try {
-      await bindHotkey();
-      await refreshHotkeyDiagnostics();
-    } catch (error) {
-      notify(`快捷键 ${launcher.settings.hotkey} 注册失败`);
-      console.warn(error);
+    if (loadResult.recoveredFromBackup) {
+      notify("主数据损坏，已从上一次备份恢复");
     }
 
     unlistenDrop = await getCurrentWebview().onDragDropEvent(async (event) => {
@@ -242,14 +334,39 @@ onMounted(async () => {
   } finally {
     loading.value = false;
   }
+
   window.addEventListener("keydown", handleKey);
   window.addEventListener("click", closeContextMenu);
   window.addEventListener("wheel", handleWheel, { passive: false });
+  await nextTick();
+  focusSearch();
+
+  void (async () => {
+    try {
+      await bindHotkey();
+      await refreshHotkeyDiagnostics();
+    } catch (error) {
+      notify(`快捷键 ${launcher.settings.hotkey} 注册失败`);
+      console.warn(error);
+    }
+  })();
+
+  targetCheckTimer = window.setInterval(() => {
+    void refreshTargetHealth();
+  }, 60_000);
+  window.setTimeout(() => {
+    void refreshTargetHealth();
+    void loadRegistryApps();
+    void hydrateIcons();
+  }, 250);
 });
 
 onBeforeUnmount(() => {
   unlistenDrop?.();
   unlistenFocus?.();
+  unlistenFocusSearch?.();
+  unlistenQuitRequest?.();
+  setPersistenceErrorHandler(undefined);
   window.removeEventListener("keydown", handleKey);
   window.removeEventListener("click", closeContextMenu);
   window.removeEventListener("wheel", handleWheel);
@@ -270,7 +387,7 @@ function restoreNavigation() {
         : savedRoot?.id)
     ?? rootGroups.value[0]?.id
     ?? "";
-  const validSpecialView = ["all", "favorites", "registry"].includes(
+  const validSpecialView = ["all", "recent", "favorites", "registry"].includes(
     savedViewId ?? "",
   );
   currentView.value = validSpecialView || savedGroup ? savedViewId as ViewId : "all";
@@ -383,10 +500,12 @@ async function launchItem(item: LauncherItem) {
 }
 
 async function loadRegistryApps(showMessage = false) {
+  if (registryLoading.value) return;
   registryLoading.value = true;
   try {
     registryItems.value = await invoke<LauncherItem[]>("registry_apps");
-    if (showMessage) void refreshTargetHealth();
+    registryLoaded.value = true;
+    void refreshTargetHealth();
     if (showMessage) notify(`已刷新 ${registryItems.value.length} 个注册表应用`);
   } catch (error) {
     notify(`读取注册表应用失败：${String(error)}`);
@@ -546,17 +665,50 @@ function confirmMissingCleanup() {
 }
 
 async function applySettings(value: LauncherSettings) {
+  if (settingsSaving.value) return;
+  settingsSaving.value = true;
+  const previous = plainClone(launcher.settings);
+  let previousAutostart = previous.startOnBoot;
+  try {
+    previousAutostart = await isEnabled();
+  } catch {
+    // Fall back to the last known setting when the OS query is unavailable.
+  }
+
   try {
     await bindHotkey(value.hotkey);
+    if (value.startOnBoot !== previousAutostart) {
+      if (value.startOnBoot) await enable();
+      else await disable();
+    }
+    Object.assign(launcher.settings, value);
+    await saveLauncher();
+    settingsOpen.value = false;
+    notify(`设置已保存，快捷键：${value.hotkey}`);
   } catch (error) {
-    notify(`快捷键 ${value.hotkey} 注册失败，请换一个组合`);
+    Object.assign(launcher.settings, previous);
+    if (activeHotkey !== previous.hotkey) {
+      try {
+        await bindHotkey(previous.hotkey);
+      } catch (restoreError) {
+        console.warn("恢复原快捷键失败", restoreError);
+      }
+    }
+    try {
+      const currentAutostart = await isEnabled();
+      if (currentAutostart !== previousAutostart) {
+        if (previousAutostart) await enable();
+        else await disable();
+      }
+    } catch (restoreError) {
+      console.warn("恢复开机启动状态失败", restoreError);
+    }
+    void saveLauncher().catch(() => {});
+    notify(`设置未保存，已恢复原设置：${String(error)}`);
     console.warn(error);
-    return;
+  } finally {
+    settingsSaving.value = false;
   }
-  Object.assign(launcher.settings, value);
-  await saveLauncher();
-  settingsOpen.value = false;
-  notify(`设置已保存，快捷键：${value.hotkey}`);
 }
 
 function itemIcon(item: LauncherItem) {
@@ -567,17 +719,193 @@ function itemIcon(item: LauncherItem) {
   return AppWindow;
 }
 
+function focusSearch(selectText = false) {
+  if (
+    itemEditor.value
+    || settingsOpen.value
+    || cleanupStage.value
+    || batchDeleteConfirmOpen.value
+  ) {
+    return;
+  }
+  void nextTick(() => {
+    searchInput.value?.focus();
+    if (selectText) searchInput.value?.select();
+  });
+}
+
+function moveActiveItem(direction: number) {
+  const count = visibleEntries.value.length;
+  if (!count) {
+    activeItemIndex.value = -1;
+    return;
+  }
+  const next = activeItemIndex.value < 0
+    ? direction > 0 ? 0 : count - 1
+    : (activeItemIndex.value + direction + count) % count;
+  activeItemIndex.value = next;
+  void nextTick(() => {
+    document
+      .querySelector<HTMLElement>(`[data-entry-index="${next}"]`)
+      ?.scrollIntoView({ block: "nearest" });
+  });
+}
+
+function handleCardAction(
+  item: LauncherItem,
+  group: LauncherGroup,
+  index: number,
+) {
+  activeItemIndex.value = index;
+  if (batchMode.value) {
+    toggleBatchItem(group.id, item.id);
+  } else {
+    void launchItem(item);
+  }
+}
+
+function itemSelectionKey(groupId: string, itemId: string) {
+  return `${groupId}\u0000${itemId}`;
+}
+
+function isBatchSelected(groupId: string, itemId: string) {
+  return batchSelection.value.has(itemSelectionKey(groupId, itemId));
+}
+
+function enterBatchMode() {
+  if (!visibleBatchEntries.value.length) {
+    notify("当前页面没有可批量操作的快捷项");
+    return;
+  }
+  batchMode.value = true;
+  batchSelection.value = new Set();
+  batchDestinationGroupId.value = currentGroupId.value;
+  activeItemIndex.value = -1;
+}
+
+function exitBatchMode() {
+  batchMode.value = false;
+  batchSelection.value = new Set();
+  batchDeleteConfirmOpen.value = false;
+}
+
+function toggleBatchItem(groupId: string, itemId: string) {
+  const key = itemSelectionKey(groupId, itemId);
+  const next = new Set(batchSelection.value);
+  if (next.has(key)) next.delete(key);
+  else next.add(key);
+  batchSelection.value = next;
+}
+
+function toggleAllVisibleBatchItems() {
+  const visibleKeys = visibleBatchEntries.value.map(({ item, group }) =>
+    itemSelectionKey(group.id, item.id),
+  );
+  const allSelected = visibleKeys.every((key) => batchSelection.value.has(key));
+  const next = new Set(batchSelection.value);
+  visibleKeys.forEach((key) => {
+    if (allSelected) next.delete(key);
+    else next.add(key);
+  });
+  batchSelection.value = next;
+}
+
+function batchSelections(): ItemSelection[] {
+  return batchSelectedEntries.value.map(({ item, group }) => ({
+    groupId: group.id,
+    itemId: item.id,
+  }));
+}
+
+function moveBatchSelection() {
+  if (!batchSelection.value.size) {
+    notify("请先选择快捷项");
+    return;
+  }
+  const moved = moveItems(batchSelections(), batchDestinationGroupId.value);
+  if (moved) notify(`已移动 ${moved} 个快捷项`);
+  exitBatchMode();
+}
+
+function favoriteBatchSelection(favorite: boolean) {
+  if (!batchSelection.value.size) {
+    notify("请先选择快捷项");
+    return;
+  }
+  const changed = setItemsFavorite(batchSelections(), favorite);
+  notify(
+    changed
+      ? `已${favorite ? "收藏" : "取消收藏"} ${changed} 个快捷项`
+      : "所选快捷项无需修改",
+  );
+  exitBatchMode();
+}
+
+function confirmBatchDelete() {
+  const removed = removeItems(batchSelections());
+  batchDeleteConfirmOpen.value = false;
+  if (removed) {
+    notify(`已移除 ${removed} 个快捷项，原文件未被删除`);
+    void refreshTargetHealth();
+  }
+  exitBatchMode();
+}
+
+function groupOptionLabel(group: LauncherGroup) {
+  return group.parentId ? `　└ ${group.name}` : group.name;
+}
+
 function handleKey(event: KeyboardEvent) {
   if (event.key === "Escape") {
-    if (itemEditor.value) itemEditor.value = undefined;
+    if (batchDeleteConfirmOpen.value) batchDeleteConfirmOpen.value = false;
+    else if (itemEditor.value) itemEditor.value = undefined;
     else if (cleanupStage.value) closeMissingCleanup();
     else if (settingsOpen.value) settingsOpen.value = false;
+    else if (batchMode.value) exitBatchMode();
     else if (query.value) query.value = "";
     else void invoke("hide_window");
+    return;
   }
   if (event.ctrlKey && event.key.toLowerCase() === "f") {
     event.preventDefault();
-    document.querySelector<HTMLInputElement>(".search-input")?.focus();
+    focusSearch(true);
+    return;
+  }
+  if (
+    itemEditor.value
+    || settingsOpen.value
+    || cleanupStage.value
+    || batchDeleteConfirmOpen.value
+  ) {
+    return;
+  }
+  if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+    event.preventDefault();
+    moveActiveItem(event.key === "ArrowDown" ? 1 : -1);
+    return;
+  }
+  if (
+    event.key === "Enter"
+    && activeItemIndex.value >= 0
+    && !(event.target as HTMLElement).closest(".launch-card")
+  ) {
+    event.preventDefault();
+    const entry = visibleEntries.value[activeItemIndex.value];
+    if (entry) handleCardAction(entry.item, entry.group, activeItemIndex.value);
+    return;
+  }
+  const target = event.target as HTMLElement;
+  const isEditable = target.matches("input, textarea, select, [contenteditable='true']");
+  if (
+    event.key.length === 1
+    && !event.ctrlKey
+    && !event.altKey
+    && !event.metaKey
+    && !isEditable
+  ) {
+    event.preventDefault();
+    query.value += event.key;
+    focusSearch();
   }
 }
 
@@ -608,7 +936,7 @@ function notify(message: string) {
 <template>
   <main
     class="app-shell"
-    :class="[`theme-${launcher.settings.theme}`, { loading }]"
+    :class="[`theme-${launcher.settings.theme}`, { loading, 'batch-mode': batchMode }]"
     :style="{ '--panel-opacity': `${launcher.settings.opacity / 100}` }"
   >
     <aside class="sidebar">
@@ -622,9 +950,13 @@ function notify(message: string) {
           <GripVertical :size="18" /><span>全部项目</span>
           <em>{{ launcher.groups.reduce((n, g) => n + g.items.length, 0) }}</em>
         </button>
+        <button :class="{ active: currentView === 'recent' }" @click="currentView = 'recent'">
+          <Clock3 :size="17" /><span>最近使用</span>
+          <em>{{ recentCount }}</em>
+        </button>
         <button class="registry-nav" :class="{ active: currentView === 'registry' }" @click="currentView = 'registry'">
           <PackageOpen :size="17" /><span>已安装应用</span>
-          <em>{{ registryLoading ? "…" : registryItems.length }}</em>
+          <em>{{ registryLoading || !registryLoaded ? "…" : registryItems.length }}</em>
         </button>
         <button :class="{ active: currentView === 'favorites' }" @click="currentView = 'favorites'">
           <Heart :size="17" /><span>我的收藏</span>
@@ -676,7 +1008,7 @@ function notify(message: string) {
       <header class="topbar" data-tauri-drag-region @mousedown="startWindowDrag">
         <div class="search-box">
           <Search :size="18" />
-          <input v-model="query" class="search-input" placeholder="搜索名称、路径或备注" />
+          <input ref="searchInput" v-model="query" class="search-input" placeholder="搜索名称、路径或备注" />
           <kbd>Ctrl F</kbd>
         </div>
         <div
@@ -732,7 +1064,15 @@ function notify(message: string) {
             <button v-if="currentView === 'registry'" class="secondary-button" :disabled="registryLoading" @click="loadRegistryApps(true)">
               <RefreshCw :size="16" :class="{ spinning: registryLoading }" />刷新注册表
             </button>
-            <template v-else>
+            <template v-else-if="!batchMode">
+              <button
+                v-if="visibleBatchEntries.length"
+                class="secondary-button batch-entry-button"
+                title="选择当前页面中的多个快捷项"
+                @click="enterBatchMode"
+              >
+                <ListChecks :size="16" />批量
+              </button>
               <button
                 v-if="visibleMissingCount"
                 class="secondary-button cleanup-button"
@@ -748,6 +1088,7 @@ function notify(message: string) {
                 <ChevronDown :size="16" />
               </button>
             </template>
+            <span v-else class="batch-mode-label">批量选择中</span>
           </div>
         </header>
 
@@ -757,26 +1098,37 @@ function notify(message: string) {
           :style="{ '--icon-size': `${launcher.settings.iconSize}px` }"
         >
           <div
-            v-for="{ item, group } in visibleEntries"
+            v-for="({ item, group }, index) in visibleEntries"
             :key="`${group.id}-${item.id}`"
             class="launch-card"
-            :class="{ 'missing-target': isMissingTarget(item) }"
+            :class="{
+              'missing-target': isMissingTarget(item),
+              'keyboard-active': activeItemIndex === index,
+              'batch-selected': isBatchSelected(group.id, item.id),
+            }"
+            :data-entry-index="index"
             role="button"
             tabindex="0"
+            :aria-pressed="batchMode ? isBatchSelected(group.id, item.id) : undefined"
             :title="itemTitle(item)"
-            @click="launchItem(item)"
-            @keydown.enter="launchItem(item)"
-            @contextmenu="showItemMenu($event, item, group.id)"
+            @click="handleCardAction(item, group, index)"
+            @mouseenter="activeItemIndex = index"
+            @keydown.enter.stop.prevent="handleCardAction(item, group, index)"
+            @keydown.space.stop.prevent="handleCardAction(item, group, index)"
+            @contextmenu="batchMode ? $event.preventDefault() : showItemMenu($event, item, group.id)"
           >
             <span class="icon-wrap" :style="{ '--accent': group.color }">
               <img v-if="item.icon" :src="item.icon" alt="" />
               <component :is="itemIcon(item)" v-else :size="Math.round(launcher.settings.iconSize * 0.52)" />
               <Heart v-if="item.favorite" class="favorite-mark" :size="13" fill="currentColor" />
+              <span v-if="batchMode" class="batch-check">
+                <Check v-if="isBatchSelected(group.id, item.id)" :size="13" stroke-width="3" />
+              </span>
             </span>
             <strong>{{ item.title }}</strong>
             <small v-if="isMissingTarget(item)" class="missing-label">目标不存在</small>
             <small v-else-if="currentView === 'all' || query || !activeGroup?.parentId">{{ groupPath(group) }}</small>
-            <button class="card-menu" title="更多" @click.stop="showItemMenu($event, item, group.id)">
+            <button v-if="!batchMode" class="card-menu" title="更多" @click.stop="showItemMenu($event, item, group.id)">
               <MoreHorizontal :size="16" />
             </button>
           </div>
@@ -784,12 +1136,34 @@ function notify(message: string) {
 
         <div v-else class="empty-state">
           <div><PanelTopClose :size="30" /></div>
-          <h2>{{ query ? "没有找到匹配项" : currentView === "registry" ? "没有找到可启动的注册表应用" : "这里还很清爽" }}</h2>
-          <p>{{ query ? "试试名称、路径或备注里的其他关键词" : currentView === "registry" ? "可点击刷新重新扫描 Windows 注册表" : "拖入程序、文件或文件夹，马上就能启动" }}</p>
-          <button v-if="!query && currentView !== 'registry'" class="primary-button" @click="pickFiles"><Plus :size="17" />添加第一个项目</button>
+          <h2>{{ query ? "没有找到匹配项" : currentView === "registry" ? "没有找到可启动的注册表应用" : currentView === "recent" ? "还没有最近使用记录" : "这里还很清爽" }}</h2>
+          <p>{{ query ? "试试名称、路径或备注里的其他关键词" : currentView === "registry" ? "可点击刷新重新扫描 Windows 注册表" : currentView === "recent" ? "启动过的快捷项会自动出现在这里" : "拖入程序、文件或文件夹，马上就能启动" }}</p>
+          <button v-if="!query && currentView !== 'registry' && currentView !== 'recent'" class="primary-button" @click="pickFiles"><Plus :size="17" />添加第一个项目</button>
         </div>
       </div>
     </section>
+
+    <div v-if="batchMode" class="batch-bar">
+      <div class="batch-count">
+        <ListChecks :size="17" />
+        <strong>已选 {{ batchSelectedEntries.length }} 项</strong>
+        <button type="button" @click="toggleAllVisibleBatchItems">
+          {{ visibleBatchEntries.length && visibleBatchEntries.every(({ item, group }) => isBatchSelected(group.id, item.id)) ? "取消全选" : "全选当前页" }}
+        </button>
+      </div>
+      <div class="batch-actions">
+        <select v-model="batchDestinationGroupId" title="目标分组">
+          <option v-for="group in orderedGroups" :key="group.id" :value="group.id">
+            {{ groupOptionLabel(group) }}
+          </option>
+        </select>
+        <button class="secondary-button" :disabled="!batchSelectedEntries.length" @click="moveBatchSelection">移动</button>
+        <button class="secondary-button" :disabled="!batchSelectedEntries.length" @click="favoriteBatchSelection(true)">收藏</button>
+        <button class="secondary-button" :disabled="!batchSelectedEntries.length" @click="favoriteBatchSelection(false)">取消收藏</button>
+        <button class="danger-button" :disabled="!batchSelectedEntries.length" @click="batchDeleteConfirmOpen = true">移除</button>
+        <button class="icon-button" title="退出批量操作" @click="exitBatchMode"><X :size="17" /></button>
+      </div>
+    </div>
 
     <div v-if="dragging" class="drop-overlay">
       <div><Plus :size="28" /><strong>松开即可添加</strong><span>将保存到“{{ activeGroup ? groupPath(activeGroup) : launcher.groups[0]?.name }}”</span></div>
@@ -909,6 +1283,44 @@ function notify(message: string) {
       </section>
     </div>
 
+    <div
+      v-if="batchDeleteConfirmOpen"
+      class="modal-backdrop"
+      @mousedown.self="batchDeleteConfirmOpen = false"
+    >
+      <section class="modal cleanup-modal confirm-cleanup-modal" role="alertdialog" aria-modal="true" aria-labelledby="batch-delete-title">
+        <header class="modal-header">
+          <div>
+            <span class="eyebrow danger-eyebrow">批量移除</span>
+            <h2 id="batch-delete-title">确认移除 {{ batchSelectedEntries.length }} 个快捷项？</h2>
+            <p>只会删除 QuickNest 记录，不会删除原程序、文件或文件夹。</p>
+          </div>
+          <button class="icon-button" title="取消" @click="batchDeleteConfirmOpen = false"><X :size="18" /></button>
+        </header>
+        <div class="cleanup-list compact">
+          <div
+            v-for="{ item, group } in batchSelectedEntries"
+            :key="`${group.id}-${item.id}`"
+            class="cleanup-item cleanup-summary"
+          >
+            <span>
+              <strong>{{ item.title }}</strong>
+              <small>{{ groupPath(group) }} · {{ item.target }}</small>
+            </span>
+          </div>
+        </div>
+        <footer class="modal-actions cleanup-actions">
+          <span class="hint">此操作会立即保存。</span>
+          <div>
+            <button class="secondary-button" @click="batchDeleteConfirmOpen = false">取消</button>
+            <button class="danger-button solid" @click="confirmBatchDelete">
+              <Trash2 :size="16" />确认移除
+            </button>
+          </div>
+        </footer>
+      </section>
+    </div>
+
     <ItemEditor
       v-if="itemEditor"
       :item="itemEditor.item"
@@ -920,6 +1332,7 @@ function notify(message: string) {
     <SettingsPanel
       v-if="settingsOpen"
       :settings="launcher.settings"
+      :saving="settingsSaving"
       @close="settingsOpen = false"
       @save="applySettings"
     />
