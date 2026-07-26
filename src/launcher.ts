@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { reactive } from "vue";
+import { migrateLauncherState } from "./migrations";
 import {
   createId,
   DEFAULT_STATE,
@@ -14,44 +15,132 @@ export const launcher = reactive<LauncherState>(
   plainClone(DEFAULT_STATE),
 );
 
+type LoadStateResponse = {
+  state: unknown | null;
+  recoveredFromBackup: boolean;
+};
+
+type PendingSave = {
+  revision: number;
+  snapshot: LauncherState;
+};
+
 let saveTimer: number | undefined;
+let nextSaveRevision = 0;
+let persistedSaveRevision = 0;
+let pendingSave: PendingSave | undefined;
+let activeSave: Promise<void> | undefined;
+let persistenceErrorHandler: ((error: unknown) => void) | undefined;
 
 export async function loadLauncher() {
-  const saved = await invoke<LauncherState | null>("load_state");
-  if (saved?.groups?.length) {
-    const savedVersion = saved.version ?? 1;
-    Object.assign(launcher, saved);
-    launcher.version = 6;
-    if (savedVersion < 4 && launcher.settings.iconSize >= 40) {
-      launcher.settings.iconSize = 32;
+  const loaded = await invoke<LoadStateResponse>("load_state");
+  if (loaded.state) {
+    const migrated = migrateLauncherState(loaded.state);
+    Object.assign(launcher, migrated.state);
+    if (migrated.changed || loaded.recoveredFromBackup) {
+      await saveLauncher();
     }
-    launcher.groups.forEach((group) => {
-      group.parentId ??= null;
-    });
+    return {
+      recoveredFromBackup: loaded.recoveredFromBackup,
+      migrated: migrated.changed,
+    };
   } else {
-    await hydrateIcons();
+    Object.assign(launcher, plainClone(DEFAULT_STATE));
     await saveLauncher();
+    return { recoveredFromBackup: false, migrated: false };
   }
 }
 
 export function scheduleSave() {
   window.clearTimeout(saveTimer);
-  saveTimer = window.setTimeout(() => void saveLauncher(), 180);
+  saveTimer = window.setTimeout(() => {
+    saveTimer = undefined;
+    void saveLauncher().catch(reportPersistenceError);
+  }, 180);
 }
 
 export async function saveLauncher() {
-  await invoke("save_state", { state: plainClone(launcher) });
+  window.clearTimeout(saveTimer);
+  saveTimer = undefined;
+  const revision = ++nextSaveRevision;
+  pendingSave = {
+    revision,
+    snapshot: plainClone(launcher),
+  };
+
+  while (persistedSaveRevision < revision) {
+    await ensureSaveDrain();
+  }
 }
 
-export async function hydrateIcons() {
-  const items = launcher.groups.flatMap((group) => group.items);
-  await Promise.all(
-    items.map(async (item) => {
-      if (!item.icon && item.kind !== "url") {
-        item.icon = await fetchIcon(item.target);
+export async function flushLauncher() {
+  await saveLauncher();
+  while (activeSave || pendingSave) {
+    await ensureSaveDrain();
+  }
+}
+
+export function setPersistenceErrorHandler(
+  handler: ((error: unknown) => void) | undefined,
+) {
+  persistenceErrorHandler = handler;
+}
+
+async function ensureSaveDrain() {
+  if (!activeSave) {
+    activeSave = drainSaves().finally(() => {
+      activeSave = undefined;
+    });
+  }
+  return activeSave;
+}
+
+async function drainSaves() {
+  while (pendingSave) {
+    const request = pendingSave;
+    pendingSave = undefined;
+    try {
+      await invoke("save_state", { state: request.snapshot });
+      persistedSaveRevision = Math.max(persistedSaveRevision, request.revision);
+    } catch (error) {
+      const newerRequest = currentPendingSave();
+      if (!newerRequest || newerRequest.revision < request.revision) {
+        pendingSave = request;
       }
-    }),
+      throw error;
+    }
+  }
+}
+
+function currentPendingSave() {
+  return pendingSave;
+}
+
+function reportPersistenceError(error: unknown) {
+  console.error("保存启动器数据失败", error);
+  persistenceErrorHandler?.(error);
+}
+
+export async function hydrateIcons(concurrency = 4) {
+  const items = launcher.groups.flatMap((group) => group.items);
+  const pending = items.filter((item) => !item.icon && item.kind !== "url");
+  let cursor = 0;
+  let hydrated = 0;
+  const worker = async () => {
+    while (cursor < pending.length) {
+      const item = pending[cursor++];
+      const icon = await fetchIcon(item.target);
+      if (icon) {
+        item.icon = icon;
+        hydrated += 1;
+      }
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, pending.length) }, worker),
   );
+  if (hydrated) scheduleSave();
+  return hydrated;
 }
 
 export async function addPaths(groupId: string, paths: string[]) {
@@ -163,6 +252,62 @@ export function removeItems(
   });
   if (removed) scheduleSave();
   return removed;
+}
+
+export function moveItems(
+  selections: Array<{ groupId: string; itemId: string }>,
+  destinationGroupId: string,
+) {
+  const destination = launcher.groups.find(
+    (group) => group.id === destinationGroupId,
+  );
+  if (!destination) return 0;
+
+  const selectionKeys = new Set(
+    selections.map(({ groupId, itemId }) => `${groupId}\u0000${itemId}`),
+  );
+  const moving: LauncherItem[] = [];
+  launcher.groups.forEach((group) => {
+    group.items.forEach((item) => {
+      if (selectionKeys.has(`${group.id}\u0000${item.id}`)) {
+        moving.push(plainClone(item));
+      }
+    });
+  });
+  if (!moving.length) return 0;
+
+  launcher.groups.forEach((group) => {
+    const remaining = group.items.filter(
+      (item) => !selectionKeys.has(`${group.id}\u0000${item.id}`),
+    );
+    group.items.splice(0, group.items.length, ...remaining);
+  });
+  destination.items.push(...moving);
+  scheduleSave();
+  return moving.length;
+}
+
+export function setItemsFavorite(
+  selections: Array<{ groupId: string; itemId: string }>,
+  favorite: boolean,
+) {
+  const selectionKeys = new Set(
+    selections.map(({ groupId, itemId }) => `${groupId}\u0000${itemId}`),
+  );
+  let changed = 0;
+  launcher.groups.forEach((group) => {
+    group.items.forEach((item) => {
+      if (
+        selectionKeys.has(`${group.id}\u0000${item.id}`)
+        && item.favorite !== favorite
+      ) {
+        item.favorite = favorite;
+        changed += 1;
+      }
+    });
+  });
+  if (changed) scheduleSave();
+  return changed;
 }
 
 export async function fetchIcon(path: string) {

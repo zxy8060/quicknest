@@ -12,6 +12,9 @@ dist
 dist-ssr
 /src-tauri/target
 *.local
+launcher.json
+launcher.json.bak
+launcher.json.tmp
 
 # Editor directories and files
 .vscode/*

@@ -41,6 +41,8 @@ export interface LauncherState {
   settings: LauncherSettings;
 }
 
+export const CURRENT_SCHEMA_VERSION = 6;
+
 export const createId = () =>
   `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`;
 
@@ -48,12 +50,13 @@ export const plainClone = <T>(value: T): T =>
   JSON.parse(JSON.stringify(value)) as T;
 
 export const DEFAULT_STATE: LauncherState = {
-  version: 6,
+  version: CURRENT_SCHEMA_VERSION,
   groups: [
     {
       id: "daily",
       name: "日常",
       color: "#7c9cff",
+      parentId: null,
       items: [
         {
           id: "starter-explorer",
@@ -94,6 +97,7 @@ export const DEFAULT_STATE: LauncherState = {
       id: "work",
       name: "工作",
       color: "#67d6b3",
+      parentId: null,
       items: [],
     },
   ],

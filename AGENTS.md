@@ -17,6 +17,7 @@ QuickNest is a local-first Windows launcher built with Tauri 2, Vue 3, TypeScrip
 ## Source of truth
 
 - `src/types.ts`: persisted schema and defaults.
+- `src/migrations.ts`: schema validation, normalization, and versioned migrations.
 - `src/launcher.ts`: state loading, saving, item/group CRUD, icon hydration.
 - `src/App.vue`: navigation, visible-page semantics, health checks, cleanup flow.
 - `src/components/SettingsPanel.vue`: hotkey recording and settings UI.
@@ -36,6 +37,9 @@ Read the relevant file before modifying behavior. Do not duplicate state ownersh
    ```
 
    unless the user explicitly asks for a data operation.
+
+   For desktop regression tests, set `QUICKNEST_DATA_DIR` to a dedicated
+   workspace-owned directory before launching QuickNest.
 
 2. Never commit:
 
@@ -75,6 +79,7 @@ See `docs/ARCHITECTURE.md` and `docs/DATA_MODEL.md` for more detail.
 - Keep native OS access behind Tauri commands.
 - Prefer computed state over duplicated mutable state.
 - Use `scheduleSave()` for normal UI mutations and `saveLauncher()` only when an immediate durable save is required.
+- Keep saves serialized through the launcher save queue and call `flushLauncher()` before an intentional process exit.
 - Keep modal destructive actions explicit and reversible at the target-file level.
 - Keep Chinese user-facing copy concise. Code identifiers and developer documentation may be English.
 - Add permissions to `src-tauri/capabilities/default.json` only when a feature requires them.
