@@ -57,6 +57,17 @@ cargo test --manifest-path .\src-tauri\Cargo.toml
 
 当前 Windows 注册表测试要求测试机至少存在一个可启动注册表应用。
 
+## 持续集成
+
+`.github/workflows/ci.yml` 在 `windows-latest` 上执行：
+
+1. 使用 `packageManager` 字段安装锁定的 pnpm 版本；
+2. `pnpm install --frozen-lockfile`；
+3. `pnpm build`；
+4. `cargo check --locked`。
+
+CI 权限只有 `contents: read`，不发布包、不使用仓库密钥。
+
 ## 正式构建
 
 ```powershell
@@ -81,6 +92,7 @@ src-tauri\target\release\bundle\nsis\QuickNest_<version>_x64-setup.exe
 3. `src-tauri/Cargo.lock` 中 `name = "quicknest"` 的 package entry
 4. `src-tauri/tauri.conf.json`
 5. `CHANGELOG.md`
+6. `THIRD_PARTY_NOTICES.md`（依赖版本发生变化时）
 
 然后依次执行：
 

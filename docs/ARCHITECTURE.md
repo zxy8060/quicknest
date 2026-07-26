@@ -105,3 +105,14 @@ Windows 实现扫描：
 ## 权限
 
 Tauri 权限位于 `src-tauri/capabilities/default.json`。新增插件或原生能力时，只授予需要的最小权限，并同步更新本文档。
+
+## WebView 内容安全策略
+
+生产 CSP 位于 `src-tauri/tauri.conf.json`，仅允许：
+
+- 当前应用自身的脚本、样式和字体；
+- Tauri IPC；
+- 内置 asset 协议；
+- 本地 Base64/blob 图标。
+
+开发 CSP 额外允许 Vite 的 `localhost:1420` HTTP 与 WebSocket 连接。不要为了临时调试把生产 `csp` 改回 `null`。

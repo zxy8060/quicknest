@@ -22,6 +22,8 @@
 - 注册表扫描只读取应用路径，不修改注册表业务数据。
 - 批量清理只移除 QuickNest 快捷项记录，不删除目标文件。
 - 图标数据和本地路径会写入 `launcher.json`，备份或分享前应检查隐私信息。
+- WebView 使用显式 Content Security Policy；放宽资源来源时必须说明原因并重新验证。
+- Tauri capability 保持最小权限，新原生能力需要同步审查权限文件。
 - 未签名构建可能触发 Windows SmartScreen，这不等同于恶意软件判定。
 
 ## 凭据

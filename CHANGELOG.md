@@ -4,7 +4,19 @@
 
 ## [Unreleased]
 
-- 暂无。
+### Security
+
+- 为 Tauri WebView 启用显式 Content Security Policy。
+- 增加只读权限的 Windows CI 和 Dependabot 更新检查。
+
+### Documentation
+
+- 增加第三方依赖许可证清单、支持入口、行为准则和 GitHub 社区模板。
+- 明确 QuickNest 与设计参考项目不存在官方关联。
+
+### Changed
+
+- 使用 QuickNest 图标替换未使用的 Vite 模板图标，并移除未引用的脚手架资源。
 
 ## [0.4.1] - 2026-07-27
 

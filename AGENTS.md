@@ -46,6 +46,8 @@ Read the relevant file before modifying behavior. Do not duplicate state ownersh
    - migration backups
    - real launcher data, local paths, tokens, or credentials
 
+   CI and community files under `.github/` are source-controlled and must keep least-privilege permissions.
+
 3. Treat deletion as launcher-record deletion only. Do not add target-file deletion to a cleanup flow.
 
 4. Do not make registry entries editable or persistent unless the data model and UX are intentionally redesigned.
@@ -110,6 +112,7 @@ The following versions must match:
 - `src-tauri/tauri.conf.json`
 
 Update `CHANGELOG.md`, run production checks, and never commit generated binaries.
+When dependency versions change, also review `THIRD_PARTY_NOTICES.md`.
 
 ## Documentation maintenance
 
