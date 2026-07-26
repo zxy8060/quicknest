@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 安全漏洞
+    url: https://github.com/zxy8060/quicknest/security/advisories/new
+    about: 请私下报告安全问题，不要在公开 Issue 中披露利用细节或个人数据。

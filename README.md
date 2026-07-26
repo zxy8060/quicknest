@@ -4,6 +4,8 @@ QuickNest 是一个轻量、离线、面向 Windows 的桌面快速启动器。�
 
 > 当前版本：`0.4.1` · 平台：Windows 10/11 · 许可证：[MIT](LICENSE)
 
+QuickNest 是独立实现项目，与 Lucy、Lily、Maye 及其作者没有隶属、授权或官方关联；这些名称只用于说明交互设计参考。
+
 ## 特性
 
 - 一级标签位于顶部，二级标签位于左侧；点击一级标签自动进入其首个二级标签
@@ -119,6 +121,9 @@ pnpm tauri build
 - [故障排查](docs/TROUBLESHOOTING.md)
 - [贡献指南](CONTRIBUTING.md)
 - [安全说明](SECURITY.md)
+- [第三方许可证说明](THIRD_PARTY_NOTICES.md)
+- [获取帮助](SUPPORT.md)
+- [社区行为准则](CODE_OF_CONDUCT.md)
 - [版本记录](CHANGELOG.md)
 - [AI 代理指南](AGENTS.md)
 
@@ -129,6 +134,13 @@ pnpm tauri build
 - 注册表应用是运行时扫描结果，不能直接编辑、收藏或批量移除。
 - 贴边自动隐藏、快捷项拖拽排序和在线同步尚未实现。
 - 当前保存方式是本地 JSON 覆盖写入；修改持久化逻辑时应优先考虑原子写入和备份策略。
+
+## 仓库安全与自动化
+
+- Windows CI 会在 push 和 Pull Request 上执行前端构建与 Rust 检查。
+- Dependabot 每周检查 npm、Cargo 和 GitHub Actions 更新。
+- Tauri WebView 使用显式 CSP，只允许本地资源、IPC、内置 asset 协议和本地 Base64 图标。
+- Issue 和 Pull Request 模板会提醒贡献者移除用户数据与个人路径。
 
 ## 设计来源与许可
 
