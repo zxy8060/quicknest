@@ -32,5 +32,5 @@ opener = "0.8"
 systemicons = "0.9"
 
 [target.'cfg(windows)'.dependencies]
-winreg = "0.55"
+winreg = "0.56"
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
