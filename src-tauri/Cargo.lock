@@ -2767,7 +2767,7 @@ dependencies = [
 
 [[package]]
 name = "quicknest"
-version = "0.4.1"
+version = "0.4.7"
 dependencies = [
  "base64 0.22.1",
  "opener",

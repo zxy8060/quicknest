@@ -43,6 +43,7 @@ import SettingsPanel from "./components/SettingsPanel.vue";
 import {
   addNestedGroup,
   addPaths,
+  fetchIcon,
   flushLauncher,
   hydrateIcons,
   launcher,
@@ -63,6 +64,9 @@ import {
   type LauncherItem,
   type LauncherSettings,
 } from "./types";
+import { resolveRootLandingView } from "./navigation";
+import { createRecentOrder, recentEntriesInOrder, recentEntryKey, registryUsageKey } from "./recent";
+import { searchAllSoftware } from "./search";
 import "./styles.css";
 
 type ViewId = "all" | "favorites" | string;
@@ -81,7 +85,7 @@ type ItemSelection = {
   itemId: string;
 };
 
-const currentView = ref<ViewId>("all");
+const currentView = ref<ViewId>("recent");
 const query = ref("");
 const loading = ref(true);
 const dragging = ref(false);
@@ -90,6 +94,9 @@ const selectedRootId = ref("");
 const registryItems = ref<LauncherItem[]>([]);
 const registryLoading = ref(false);
 const registryLoaded = ref(false);
+const registryIconCache = new Map<string, string>();
+const pendingRegistryIcons = new Map<string, Promise<string | undefined>>();
+const recentOrder = ref<string[]>([]);
 const hotkeyTriggerCount = ref(0);
 const missingTargets = ref<Set<string>>(new Set());
 const targetCheckInProgress = ref(false);
@@ -119,6 +126,7 @@ let unlistenQuitRequest: (() => void) | undefined;
 let activeHotkey = "";
 let targetCheckTimer: number | undefined;
 let lastTargetCheck = 0;
+let preserveNextBlurUntil = 0;
 let navigationReady = false;
 
 const activeGroup = computed(() =>
@@ -149,13 +157,10 @@ const orderedGroups = computed(() =>
   ]),
 );
 
-const recentCount = computed(() =>
-  launcher.groups.reduce(
-    (count, group) =>
-      count + group.items.filter((item) => Boolean(item.lastLaunched)).length,
-    0,
-  ),
+const recentEntries = computed(() =>
+  recentEntriesInOrder(launcher.groups, registryGroup.value, launcher.registryUsage, recentOrder.value),
 );
+const recentFrequentCount = computed(() => recentEntries.value.length);
 
 function childGroups(parentId: string) {
   return launcher.groups.filter((group) => group.parentId === parentId);
@@ -181,29 +186,18 @@ const visibleEntries = computed(() => {
   const customEntries = launcher.groups.flatMap((group) =>
     group.items.map((item) => ({ item, group })),
   );
+  if (normalized) {
+    return searchAllSoftware(
+      launcher.groups,
+      registryGroup.value,
+      normalized,
+    );
+  }
   const source =
-    normalized
-      ? [
-          ...customEntries,
-          ...registryItems.value.map((item) => ({
-            item,
-            group: registryGroup.value,
-          })),
-        ]
-      : currentView.value === "all"
-        ? customEntries
+    currentView.value === "all"
+      ? customEntries
       : currentView.value === "recent"
-        ? launcher.groups
-            .flatMap((group) =>
-              group.items
-                .filter((item) => Boolean(item.lastLaunched))
-                .map((item) => ({ item, group })),
-            )
-            .sort(
-              (left, right) =>
-                (right.item.lastLaunched ?? 0) - (left.item.lastLaunched ?? 0)
-                || right.item.launchCount - left.item.launchCount,
-            )
+        ? recentEntries.value
       : currentView.value === "registry"
         ? registryItems.value.map((item) => ({
             item,
@@ -221,13 +215,7 @@ const visibleEntries = computed(() => {
             )
           : [];
 
-  if (!normalized) return source;
-  return source.filter(({ item }) =>
-    [item.title, item.target, item.notes]
-      .join(" ")
-      .toLocaleLowerCase()
-      .includes(normalized),
-  );
+  return source;
 });
 
 const visibleMissingCount = computed(() =>
@@ -252,7 +240,7 @@ const batchSelectedEntries = computed(() =>
 
 const viewTitle = computed(() => {
   if (currentView.value === "all") return "全部项目";
-  if (currentView.value === "recent") return "最近使用";
+  if (currentView.value === "recent") return "最近常用";
   if (currentView.value === "registry") return "已安装应用";
   if (currentView.value === "favorites") return "我的收藏";
   return activeGroup.value ? groupPath(activeGroup.value) : "启动项";
@@ -270,12 +258,23 @@ watch([currentView, selectedRootId], ([viewId, rootId]) => {
   if (!navigationReady) return;
   launcher.settings.lastViewId = viewId;
   launcher.settings.lastRootId = rootId;
+  const group = launcher.groups.find((entry) => entry.id === viewId);
+  const owningRootId = group?.parentId ?? group?.id;
+  if (group && owningRootId === rootId) {
+    launcher.settings.lastViewByRoot[rootId] = viewId;
+  }
   scheduleSave();
 });
 
 watch([currentView, query], () => {
   activeItemIndex.value = -1;
   if (batchMode.value) exitBatchMode();
+});
+
+watch(query, (value) => {
+  if (value.trim() && !registryLoaded.value) {
+    void loadRegistryApps();
+  }
 });
 
 watch(currentView, (viewId) => {
@@ -290,6 +289,7 @@ onMounted(async () => {
   });
   try {
     unlistenFocusSearch = await listen("quicknest://focus-search", () => {
+      openDefaultView();
       focusSearch();
     });
     unlistenQuitRequest = await listen("quicknest://request-quit", async () => {
@@ -302,6 +302,7 @@ onMounted(async () => {
     });
 
     const loadResult = await loadLauncher();
+    recentOrder.value = createRecentOrder(launcher.groups, launcher.registryUsage);
     restoreNavigation();
     if (loadResult.recoveredFromBackup) {
       notify("主数据损坏，已从上一次备份恢复");
@@ -324,8 +325,16 @@ onMounted(async () => {
           await refreshHotkeyDiagnostics();
           if (Date.now() - lastTargetCheck > 30_000) void refreshTargetHealth();
         }
-        if (!payload && launcher.settings.hideOnBlur && !pinned.value) {
-          await invoke("hide_window");
+        if (!payload) {
+          const preserveVisibility = Date.now() < preserveNextBlurUntil;
+          preserveNextBlurUntil = 0;
+          if (
+            launcher.settings.hideOnBlur
+            && !pinned.value
+            && !preserveVisibility
+          ) {
+            await invoke("hide_window");
+          }
         }
       },
     );
@@ -387,11 +396,15 @@ function restoreNavigation() {
         : savedRoot?.id)
     ?? rootGroups.value[0]?.id
     ?? "";
-  const validSpecialView = ["all", "recent", "favorites", "registry"].includes(
-    savedViewId ?? "",
-  );
-  currentView.value = validSpecialView || savedGroup ? savedViewId as ViewId : "all";
+  currentView.value = "recent";
   navigationReady = true;
+}
+
+function openDefaultView() {
+  if (batchMode.value) exitBatchMode();
+  query.value = "";
+  activeItemIndex.value = -1;
+  currentView.value = "recent";
 }
 
 async function refreshTargetHealth() {
@@ -480,22 +493,39 @@ async function pickFolder() {
 }
 
 async function launchItem(item: LauncherItem) {
+  preserveNextBlurUntil = Date.now() + 30_000;
   try {
     await invoke("launch_target", {
       target: item.target,
       args: item.args,
       workingDir: item.workingDir,
     });
-    if (!isRegistryItem(item)) {
+    if (isRegistryItem(item)) {
+      const key = registryUsageKey(item);
+      launcher.registryUsage[key] = {
+        launchCount: (launcher.registryUsage[key]?.launchCount ?? 0) + 1,
+        lastLaunched: Date.now(),
+      };
+      void ensureRegistryIcon(item);
+    } else {
       item.launchCount += 1;
       item.lastLaunched = Date.now();
-      scheduleSave();
     }
-    if (launcher.settings.hideOnLaunch && !pinned.value) {
-      await invoke("hide_window");
-    }
+    const key = recentEntryKey(item);
+    if (!recentOrder.value.includes(key)) recentOrder.value.push(key);
+    scheduleSave();
+    if (query.value) query.value = "";
   } catch (error) {
+    preserveNextBlurUntil = 0;
     notify(`无法打开：${String(error)}`);
+  }
+}
+
+async function minimizeToTray() {
+  try {
+    await invoke("hide_window");
+  } catch (error) {
+    notify(`无法收起窗口：${String(error)}`);
   }
 }
 
@@ -505,6 +535,7 @@ async function loadRegistryApps(showMessage = false) {
   try {
     registryItems.value = await invoke<LauncherItem[]>("registry_apps");
     registryLoaded.value = true;
+    void hydrateUsedRegistryIcons();
     void refreshTargetHealth();
     if (showMessage) notify(`已刷新 ${registryItems.value.length} 个注册表应用`);
   } catch (error) {
@@ -512,6 +543,39 @@ async function loadRegistryApps(showMessage = false) {
   } finally {
     registryLoading.value = false;
   }
+}
+
+async function ensureRegistryIcon(item: LauncherItem) {
+  const key = registryUsageKey(item);
+  let icon = registryIconCache.get(key) ?? item.icon;
+  if (!icon) {
+    let pending = pendingRegistryIcons.get(key);
+    if (!pending) {
+      pending = fetchIcon(item.target).finally(() => pendingRegistryIcons.delete(key));
+      pendingRegistryIcons.set(key, pending);
+    }
+    icon = await pending;
+  }
+  if (!icon) return; // Retry on the next successful launch or registry scan.
+  registryIconCache.set(key, icon);
+  // A scan may have replaced the array while extraction was in flight.
+  // Update the live source so search and recent-page copies receive the icon too.
+  registryItems.value.forEach((entry) => {
+    if (registryUsageKey(entry) === key) entry.icon = icon;
+  });
+}
+
+async function hydrateUsedRegistryIcons() {
+  const usedItems = registryItems.value.filter((item) =>
+    Boolean(launcher.registryUsage[registryUsageKey(item)]),
+  );
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < usedItems.length) {
+      await ensureRegistryIcon(usedItems[cursor++]);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(4, usedItems.length) }, worker));
 }
 
 function isRegistryItem(item: LauncherItem) {
@@ -537,7 +601,11 @@ function addNewGroup(parent?: LauncherGroup) {
 
 function selectRoot(group: LauncherGroup) {
   selectedRootId.value = group.id;
-  currentView.value = childGroups(group.id)[0]?.id ?? group.id;
+  currentView.value = resolveRootLandingView(
+    group.id,
+    launcher.groups,
+    launcher.settings.lastViewByRoot,
+  );
 }
 
 function selectRootSummary(group: LauncherGroup) {
@@ -568,6 +636,12 @@ function deleteGroup(group: LauncherGroup) {
     notify("至少要保留一个分组");
     return;
   }
+  Object.entries(launcher.settings.lastViewByRoot).forEach(([rootId, viewId]) => {
+    const view = launcher.groups.find((entry) => entry.id === viewId);
+    if (!view || !launcher.groups.some((entry) => entry.id === rootId && !entry.parentId)) {
+      delete launcher.settings.lastViewByRoot[rootId];
+    }
+  });
   if (group.id === selectedRootId.value) {
     selectedRootId.value = rootGroups.value[0]?.id ?? "";
   }
@@ -592,6 +666,13 @@ function showItemMenu(event: MouseEvent, item: LauncherItem, groupId: string) {
 
 function closeContextMenu() {
   contextMenu.value = undefined;
+}
+
+function openContextItem() {
+  const item = contextMenu.value?.item;
+  if (!item) return;
+  closeContextMenu();
+  void launchItem(item);
 }
 
 function toggleFavorite(item: LauncherItem) {
@@ -751,17 +832,21 @@ function moveActiveItem(direction: number) {
   });
 }
 
-function handleCardAction(
-  item: LauncherItem,
+function selectCard(
   group: LauncherGroup,
+  itemId: string,
   index: number,
+  event?: MouseEvent,
 ) {
   activeItemIndex.value = index;
-  if (batchMode.value) {
-    toggleBatchItem(group.id, item.id);
-  } else {
-    void launchItem(item);
+  if (batchMode.value && (!event || event.detail === 1)) {
+    toggleBatchItem(group.id, itemId);
   }
+}
+
+function activateCard(item: LauncherItem, index: number) {
+  activeItemIndex.value = index;
+  if (!batchMode.value) void launchItem(item);
 }
 
 function itemSelectionKey(groupId: string, itemId: string) {
@@ -891,7 +976,7 @@ function handleKey(event: KeyboardEvent) {
   ) {
     event.preventDefault();
     const entry = visibleEntries.value[activeItemIndex.value];
-    if (entry) handleCardAction(entry.item, entry.group, activeItemIndex.value);
+    if (entry) activateCard(entry.item, activeItemIndex.value);
     return;
   }
   const target = event.target as HTMLElement;
@@ -951,8 +1036,8 @@ function notify(message: string) {
           <em>{{ launcher.groups.reduce((n, g) => n + g.items.length, 0) }}</em>
         </button>
         <button :class="{ active: currentView === 'recent' }" @click="currentView = 'recent'">
-          <Clock3 :size="17" /><span>最近使用</span>
-          <em>{{ recentCount }}</em>
+          <Clock3 :size="17" /><span>最近常用</span>
+          <em>{{ recentFrequentCount }}</em>
         </button>
         <button class="registry-nav" :class="{ active: currentView === 'registry' }" @click="currentView = 'registry'">
           <PackageOpen :size="17" /><span>已安装应用</span>
@@ -1008,7 +1093,7 @@ function notify(message: string) {
       <header class="topbar" data-tauri-drag-region @mousedown="startWindowDrag">
         <div class="search-box">
           <Search :size="18" />
-          <input ref="searchInput" v-model="query" class="search-input" placeholder="搜索名称、路径或备注" />
+          <input ref="searchInput" v-model="query" class="search-input" placeholder="搜索全部软件（名称、路径或备注）" />
           <kbd>Ctrl F</kbd>
         </div>
         <div
@@ -1026,7 +1111,7 @@ function notify(message: string) {
           <button :title="pinned ? '取消钉住' : '钉住窗口'" @click="pinned = !pinned">
             <PinOff v-if="pinned" :size="17" /><Pin v-else :size="17" />
           </button>
-          <button title="最小化" @click="getCurrentWindow().minimize()"><Minus :size="18" /></button>
+          <button title="最小化到托盘" aria-label="最小化到托盘" @click="minimizeToTray"><Minus :size="18" /></button>
           <button title="隐藏到托盘" @click="invoke('hide_window')"><X :size="18" /></button>
         </div>
       </header>
@@ -1056,6 +1141,7 @@ function notify(message: string) {
             <h1>{{ viewTitle }}</h1>
             <p>
               {{ visibleEntries.length }} 个项目
+              <span v-if="!batchMode"> · 双击打开</span>
               <span v-if="targetCheckInProgress"> · 检测目标中…</span>
               <span v-else-if="visibleMissingCount" class="missing-count"> · {{ visibleMissingCount }} 个目标不存在</span>
             </p>
@@ -1110,11 +1196,12 @@ function notify(message: string) {
             role="button"
             tabindex="0"
             :aria-pressed="batchMode ? isBatchSelected(group.id, item.id) : undefined"
+            :aria-label="batchMode ? `选择 ${item.title}` : `双击打开 ${item.title}，回车也可启动`"
             :title="itemTitle(item)"
-            @click="handleCardAction(item, group, index)"
-            @mouseenter="activeItemIndex = index"
-            @keydown.enter.stop.prevent="handleCardAction(item, group, index)"
-            @keydown.space.stop.prevent="handleCardAction(item, group, index)"
+            @click="selectCard(group, item.id, index, $event)"
+            @dblclick="activateCard(item, index)"
+            @keydown.enter.stop.prevent="activateCard(item, index)"
+            @keydown.space.stop.prevent="selectCard(group, item.id, index)"
             @contextmenu="batchMode ? $event.preventDefault() : showItemMenu($event, item, group.id)"
           >
             <span class="icon-wrap" :style="{ '--accent': group.color }">
@@ -1128,7 +1215,7 @@ function notify(message: string) {
             <strong>{{ item.title }}</strong>
             <small v-if="isMissingTarget(item)" class="missing-label">目标不存在</small>
             <small v-else-if="currentView === 'all' || query || !activeGroup?.parentId">{{ groupPath(group) }}</small>
-            <button v-if="!batchMode" class="card-menu" title="更多" @click.stop="showItemMenu($event, item, group.id)">
+            <button v-if="!batchMode" class="card-menu" title="更多" @click.stop="showItemMenu($event, item, group.id)" @dblclick.stop>
               <MoreHorizontal :size="16" />
             </button>
           </div>
@@ -1136,8 +1223,8 @@ function notify(message: string) {
 
         <div v-else class="empty-state">
           <div><PanelTopClose :size="30" /></div>
-          <h2>{{ query ? "没有找到匹配项" : currentView === "registry" ? "没有找到可启动的注册表应用" : currentView === "recent" ? "还没有最近使用记录" : "这里还很清爽" }}</h2>
-          <p>{{ query ? "试试名称、路径或备注里的其他关键词" : currentView === "registry" ? "可点击刷新重新扫描 Windows 注册表" : currentView === "recent" ? "启动过的快捷项会自动出现在这里" : "拖入程序、文件或文件夹，马上就能启动" }}</p>
+          <h2>{{ query ? "没有找到匹配项" : currentView === "registry" ? "没有找到可启动的注册表应用" : currentView === "recent" ? "还没有常用记录" : "这里还很清爽" }}</h2>
+          <p>{{ query ? "试试名称、路径或备注里的其他关键词" : currentView === "registry" ? "可点击刷新重新扫描 Windows 注册表" : currentView === "recent" ? "启动过的快捷项会按使用次数和最近时间排列" : "拖入程序、文件或文件夹，马上就能启动" }}</p>
           <button v-if="!query && currentView !== 'registry' && currentView !== 'recent'" class="primary-button" @click="pickFiles"><Plus :size="17" />添加第一个项目</button>
         </div>
       </div>
@@ -1175,7 +1262,7 @@ function notify(message: string) {
       :style="{ left: `${contextMenu.x}px`, top: `${contextMenu.y}px` }"
       @click.stop
     >
-      <button @click="launchItem(contextMenu.item)"><AppWindow :size="16" />打开</button>
+      <button @click="openContextItem"><AppWindow :size="16" />打开</button>
       <button v-if="!isRegistryItem(contextMenu.item)" @click="itemEditor = { item: contextMenu.item, groupId: contextMenu.groupId }; closeContextMenu()">
         <Pencil :size="16" />编辑
       </button>

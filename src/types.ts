@@ -33,15 +33,22 @@ export interface LauncherSettings {
   theme: Theme;
   lastViewId?: string;
   lastRootId?: string;
+  lastViewByRoot: Record<string, string>;
 }
 
 export interface LauncherState {
   version: number;
   groups: LauncherGroup[];
   settings: LauncherSettings;
+  registryUsage: Record<string, LaunchUsage>;
 }
 
-export const CURRENT_SCHEMA_VERSION = 6;
+export interface LaunchUsage {
+  launchCount: number;
+  lastLaunched: number;
+}
+
+export const CURRENT_SCHEMA_VERSION = 8;
 
 export const createId = () =>
   `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`;
@@ -51,6 +58,7 @@ export const plainClone = <T>(value: T): T =>
 
 export const DEFAULT_STATE: LauncherState = {
   version: CURRENT_SCHEMA_VERSION,
+  registryUsage: {},
   groups: [
     {
       id: "daily",
@@ -104,12 +112,13 @@ export const DEFAULT_STATE: LauncherState = {
   settings: {
     hotkey: "Ctrl+Shift+Space",
     startOnBoot: false,
-    hideOnLaunch: true,
+    hideOnLaunch: false,
     hideOnBlur: false,
     iconSize: 32,
     opacity: 96,
     theme: "midnight",
-    lastViewId: "all",
+    lastViewId: "recent",
     lastRootId: "daily",
+    lastViewByRoot: {},
   },
 };

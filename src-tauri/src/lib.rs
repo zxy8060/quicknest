@@ -5,7 +5,7 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::atomic::{AtomicUsize, Ordering},
 };
 use tauri::{
@@ -167,9 +167,13 @@ fn save_state(app: AppHandle, state: serde_json::Value) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn icon_for_path(path: String) -> Result<String, String> {
-    let bytes = systemicons::get_icon(&path, 64).map_err(|error| error.message)?;
-    Ok(format!("data:image/png;base64,{}", STANDARD.encode(bytes)))
+async fn icon_for_path(path: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let bytes = systemicons::get_icon(&path, 64).map_err(|error| error.message)?;
+        Ok(format!("data:image/png;base64,{}", STANDARD.encode(bytes)))
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[derive(Clone, Serialize)]
@@ -368,18 +372,42 @@ fn launch_target(target: String, args: String, working_dir: String) -> Result<()
         if !args.trim().is_empty() {
             command.args(split_windows_args(&args));
         }
-        if !working_dir.trim().is_empty() {
-            command.current_dir(working_dir);
-        } else if let Some(parent) = path.parent() {
-            command.current_dir(parent);
+        if let Some(directory) = launch_working_directory(path, &working_dir)? {
+            command.current_dir(directory);
         }
         #[cfg(target_os = "windows")]
         command.creation_flags(CREATE_NO_WINDOW);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
         command.spawn().map_err(|error| error.to_string())?;
         return Ok(());
     }
 
     opener::open(path).map_err(|error| error.to_string())
+}
+
+fn launch_working_directory(target: &Path, configured: &str) -> Result<Option<PathBuf>, String> {
+    let value = configured.trim().trim_matches('"');
+    let directory = if value.is_empty() {
+        target.parent()
+    } else {
+        let path = Path::new(value);
+        // Older imported shortcuts sometimes store the executable as the working directory.
+        if path.is_file() {
+            path.parent()
+        } else {
+            Some(path)
+        }
+    };
+    let Some(directory) = directory.filter(|path| !path.as_os_str().is_empty()) else {
+        return Ok(None);
+    };
+    if !directory.is_dir() {
+        return Err(format!("工作目录不存在或无法访问：{}", directory.display()));
+    }
+    Ok(Some(directory.to_path_buf()))
 }
 
 fn split_windows_args(value: &str) -> Vec<String> {
@@ -415,6 +443,9 @@ fn reveal_target(target: String) -> Result<(), String> {
         }
         command
             .creation_flags(CREATE_NO_WINDOW)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .spawn()
             .map_err(|error| error.to_string())?;
         Ok(())
@@ -494,9 +525,58 @@ async fn check_targets(targets: Vec<String>) -> Result<HashMap<String, bool>, St
     .map_err(|error| error.to_string())
 }
 
+fn cursor_monitor(window: &tauri::WebviewWindow) -> tauri::Result<Option<tauri::Monitor>> {
+    let cursor = window.cursor_position()?;
+    window.monitor_from_point(cursor.x, cursor.y)
+}
+
+fn is_on_cursor_monitor(window: &tauri::WebviewWindow) -> bool {
+    match (cursor_monitor(window), window.current_monitor()) {
+        (Ok(Some(cursor)), Ok(Some(current))) => cursor.position() == current.position(),
+        _ => true,
+    }
+}
+
+fn centered_coordinate(origin: i32, available: u32, size: u32) -> i32 {
+    origin.saturating_add((available.saturating_sub(size) / 2) as i32)
+}
+
+fn position_on_cursor_monitor(window: &tauri::WebviewWindow) -> tauri::Result<()> {
+    let Some(monitor) = cursor_monitor(window)? else {
+        return Ok(());
+    };
+    // Preserve a manually placed window when it is already on the pointer's screen.
+    let area = monitor.work_area();
+    let size = window.outer_size()?;
+    let position = window.outer_position()?;
+    if is_on_cursor_monitor(window)
+        && position.x >= area.position.x
+        && position.y >= area.position.y
+        && i64::from(position.x) + i64::from(size.width)
+            <= i64::from(area.position.x) + i64::from(area.size.width)
+        && i64::from(position.y) + i64::from(size.height)
+            <= i64::from(area.position.y) + i64::from(area.size.height)
+    {
+        return Ok(());
+    }
+    if window.is_maximized()? {
+        window.unmaximize()?;
+    }
+    let scale = monitor.scale_factor() / window.scale_factor()?;
+    let width = (f64::from(size.width) * scale).round() as u32;
+    let height = (f64::from(size.height) * scale).round() as u32;
+    window.set_position(tauri::PhysicalPosition::new(
+        centered_coordinate(area.position.x, area.size.width, width),
+        centered_coordinate(area.position.y, area.size.height, height),
+    ))
+}
+
 fn show_main(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.unminimize();
+        if let Err(error) = position_on_cursor_monitor(&window) {
+            eprintln!("无法将窗口定位到指针屏幕：{error}");
+        }
         let _ = window.show();
         let _ = window.set_focus();
         let _ = window.emit("quicknest://focus-search", ());
@@ -518,12 +598,13 @@ pub fn run() {
                     }
                     HOTKEY_TRIGGER_COUNT.fetch_add(1, Ordering::Relaxed);
                     if let Some(window) = app.get_webview_window("main") {
-                        if window.is_visible().unwrap_or(false) {
+                        let should_hide = window.is_visible().unwrap_or(false)
+                            && window.is_focused().unwrap_or(false)
+                            && is_on_cursor_monitor(&window);
+                        if should_hide {
                             let _ = window.hide();
                         } else {
-                            let _ = window.unminimize();
-                            let _ = window.show();
-                            let _ = window.set_focus();
+                            show_main(app);
                         }
                     }
                 })
@@ -567,6 +648,8 @@ pub fn run() {
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.hide();
                 }
+            } else {
+                show_main(app.handle());
             }
             Ok(())
         })
@@ -595,11 +678,21 @@ pub fn run() {
 
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
-    use super::{registry_apps, replace_file, write_synced};
+    use super::{
+        centered_coordinate, launch_target, launch_working_directory, registry_apps, replace_file,
+        write_synced,
+    };
     use std::{
         fs, process,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    #[test]
+    fn window_center_handles_negative_monitors_and_small_work_areas() {
+        assert_eq!(centered_coordinate(-1920, 1920, 960), -1440);
+        assert_eq!(centered_coordinate(40, 1040, 640), 240);
+        assert_eq!(centered_coordinate(-1080, 1080, 1440), -1080);
+    }
 
     #[test]
     fn registry_scan_finds_launchable_apps() {
@@ -609,6 +702,44 @@ mod tests {
             "registry scan returned no launchable apps"
         );
         eprintln!("registry apps found: {}", apps.len());
+    }
+
+    #[test]
+    fn executable_launch_does_not_inherit_parent_stdio() {
+        let command = std::env::var("ComSpec").expect("ComSpec should be available");
+        launch_target(command, "/D /C exit 0".to_string(), String::new())
+            .expect("executable should launch with detached standard handles");
+    }
+
+    #[test]
+    fn imported_file_working_directory_launches_from_its_parent() {
+        let executable = std::env::var("ComSpec").expect("ComSpec should be available");
+        let path = std::path::Path::new(&executable);
+        assert_eq!(
+            launch_working_directory(path, &format!("  \"{executable}\"  ")).unwrap(),
+            path.parent().map(std::path::Path::to_path_buf)
+        );
+        launch_target(executable.clone(), "/D /C exit 0".into(), executable)
+            .expect("legacy working directory pointing to an exe should launch");
+    }
+
+    #[test]
+    fn working_directory_preserves_valid_folders_and_reports_missing_ones() {
+        let executable = std::env::var("ComSpec").unwrap();
+        let path = std::path::Path::new(&executable);
+        let directory = std::env::temp_dir();
+        assert_eq!(
+            launch_working_directory(path, directory.to_str().unwrap()).unwrap(),
+            Some(directory.clone())
+        );
+        let missing = directory.join(format!("quicknest-missing-dir-{}", process::id()));
+        assert!(launch_working_directory(path, missing.to_str().unwrap())
+            .unwrap_err()
+            .contains("工作目录"));
+        assert_eq!(
+            launch_working_directory(std::path::Path::new("app.exe"), "").unwrap(),
+            None
+        );
     }
 
     #[test]

@@ -150,10 +150,6 @@ function save() {
           <input v-model="form.startOnBoot" type="checkbox" class="switch" />
         </label>
         <label class="setting-row">
-          <div><strong>启动项目后隐藏</strong><small>点击应用后自动收起面板</small></div>
-          <input v-model="form.hideOnLaunch" type="checkbox" class="switch" />
-        </label>
-        <label class="setting-row">
           <div><strong>失去焦点后隐藏</strong><small>适合把 QuickNest 当作临时浮层</small></div>
           <input v-model="form.hideOnBlur" type="checkbox" class="switch" />
         </label>

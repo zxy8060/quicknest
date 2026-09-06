@@ -18,12 +18,13 @@ Rust 通过 Tauri 的 `app_data_dir()` 解析目录。该文件包含个人应�
 
 ## 顶层结构
 
-当前 schema 版本是 `6`：
+当前 schema 版本是 `8`：
 
 ```json
 {
-  "version": 6,
+  "version": 8,
   "groups": [],
+  "registryUsage": {},
   "settings": {}
 }
 ```
@@ -35,6 +36,17 @@ Rust 通过 Tauri 的 `app_data_dir()` 解析目录。该文件包含个人应�
 | `version` | `number` | 数据结构版本，不等同于应用版本 |
 | `groups` | `LauncherGroup[]` | 用户自定义分组 |
 | `settings` | `LauncherSettings` | 用户偏好和最后位置 |
+| `registryUsage` | `Record<string, LaunchUsage>` | 已安装应用的启动次数与最后使用时间 |
+
+`registryUsage` 只保存用户成功启动过的已安装应用统计，不保存注册表扫描
+列表或瞬态 ID。键为 `[target, args, workingDir]` 的 JSON 字符串；路径统一
+为小写反斜杠形式，参数保留大小写。值为 `{ launchCount, lastLaunched }`。
+旧版数据缺少此字段时补为空对象，无效统计被过滤；应用卸载后统计保留，
+但扫描不到的应用不会展示。重新扫描到相同启动目标时可恢复使用记录。
+
+常用列表启动时以当前统计计算顺序，并将顺序保存在内存。后续成功启动会
+实时进入保存队列，首次使用的项目追加到末尾；重新唤起窗口或刷新注册表
+不会重排。删除自定义快捷项仍立即移除对应显示，重启进程后才重新计算排名。
 
 ## 分组
 
@@ -89,24 +101,38 @@ Rust 通过 Tauri 的 `app_data_dir()` 解析目录。该文件包含个人应�
 {
   "hotkey": "Shift+Q",
   "startOnBoot": false,
-  "hideOnLaunch": true,
+  "hideOnLaunch": false,
   "hideOnBlur": false,
   "iconSize": 32,
   "opacity": 96,
   "theme": "midnight",
-  "lastViewId": "all",
-  "lastRootId": "group-id"
+  "lastViewId": "recent",
+  "lastRootId": "group-id",
+  "lastViewByRoot": {
+    "group-id": "child-group-id"
+  }
 }
 ```
+
+`hideOnLaunch` 仅为兼容旧版配置而保留；当前版本启动快捷项后始终保持
+QuickNest 界面可见。
 
 `lastViewId` 可以是：
 
 - `all`
+- `recent`
 - `favorites`
 - `registry`
 - 任意仍存在的分组 ID
 
-如果保存位置已经不存在，应用会回退到“全部项目”和第一个根分组。
+`lastViewId` 继续记录最后浏览页以兼容旧数据；启动和每次重新唤起时，
+界面固定进入“最近常用”。如果保存的一级分组不存在，则选中第一个一级
+分组作为后续分组导航的回退。
+
+`lastViewByRoot` 保存每个一级分组最后停留的页面。值只能是该一级分组
+自身的汇总页 ID，或它的直属二级分组 ID。迁移会丢弃已删除、跨一级或
+层级不合法的映射；旧数据会使用 `lastRootId` 与 `lastViewId` 补出当前
+一级分组的首条记录。
 
 ## 非持久化数据
 
@@ -126,7 +152,7 @@ Rust 通过 Tauri 的 `app_data_dir()` 解析目录。该文件包含个人应�
 - 拒绝高于当前应用支持版本的数据，避免旧版应用覆盖新版数据；
 - 为旧数据补齐字段和默认设置；
 - 修正重复 ID、孤儿分组和超过两级的父子关系；
-- 约束主题、图标尺寸、透明度和最后浏览位置；
+- 约束主题、图标尺寸、透明度、全局最后浏览位置和各一级分组最后位置；
 - 保留可识别的用户快捷项，不因缺少新字段而丢弃记录。
 
 修改 schema 时：

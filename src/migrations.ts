@@ -42,6 +42,7 @@ export function migrateLauncherState(input: unknown): MigrationResult {
     version: CURRENT_SCHEMA_VERSION,
     groups,
     settings: normalizeSettings(input.settings, groups),
+    registryUsage: normalizeRegistryUsage(input.registryUsage),
   };
 
   return {
@@ -49,6 +50,18 @@ export function migrateLauncherState(input: unknown): MigrationResult {
     changed: sourceVersion !== CURRENT_SCHEMA_VERSION
       || JSON.stringify(input) !== JSON.stringify(state),
   };
+}
+
+function normalizeRegistryUsage(value: unknown): LauncherState["registryUsage"] {
+  if (!isRecord(value)) return {};
+  return Object.fromEntries(Object.entries(value).flatMap(([key, usage]) => {
+    if (!isRecord(usage)) return [];
+    const launchCount = Math.max(0, Math.floor(finiteNumber(usage.launchCount, 0)));
+    const lastLaunched = finiteNumber(usage.lastLaunched, 0);
+    return launchCount > 0 && lastLaunched > 0
+      ? [[key, { launchCount, lastLaunched }]]
+      : [];
+  }));
 }
 
 function normalizeGroups(value: unknown): LauncherGroup[] {
@@ -135,6 +148,19 @@ function normalizeSettings(
   const validRootIds = new Set(roots.map((group) => group.id));
   const lastViewId = stringValue(settings.lastViewId);
   const lastRootId = stringValue(settings.lastRootId);
+  const lastViewByRoot = normalizeLastViewByRoot(
+    settings.lastViewByRoot,
+    groups,
+  );
+  const restoredRootId = validRootIds.has(lastRootId)
+    ? lastRootId
+    : roots[0]?.id ?? "";
+  if (
+    !lastViewByRoot[restoredRootId]
+    && viewBelongsToRoot(lastViewId, restoredRootId, groups)
+  ) {
+    lastViewByRoot[restoredRootId] = lastViewId;
+  }
   const theme = THEMES.has(settings.theme as Theme)
     ? settings.theme as Theme
     : DEFAULT_STATE.settings.theme;
@@ -145,10 +171,7 @@ function normalizeSettings(
       settings.startOnBoot,
       DEFAULT_STATE.settings.startOnBoot,
     ),
-    hideOnLaunch: booleanValue(
-      settings.hideOnLaunch,
-      DEFAULT_STATE.settings.hideOnLaunch,
-    ),
+    hideOnLaunch: false,
     hideOnBlur: booleanValue(
       settings.hideOnBlur,
       DEFAULT_STATE.settings.hideOnBlur,
@@ -169,11 +192,37 @@ function normalizeSettings(
       ),
     ),
     theme,
-    lastViewId: validViewIds.has(lastViewId) ? lastViewId : "all",
-    lastRootId: validRootIds.has(lastRootId)
-      ? lastRootId
-      : roots[0]?.id ?? "",
+    lastViewId: validViewIds.has(lastViewId) ? lastViewId : "recent",
+    lastRootId: restoredRootId,
+    lastViewByRoot,
   };
+}
+
+function normalizeLastViewByRoot(
+  value: unknown,
+  groups: LauncherGroup[],
+) {
+  if (!isRecord(value)) return {};
+  const normalized: Record<string, string> = {};
+  Object.entries(value).forEach(([rootId, viewId]) => {
+    const normalizedViewId = stringValue(viewId);
+    if (viewBelongsToRoot(normalizedViewId, rootId, groups)) {
+      normalized[rootId] = normalizedViewId;
+    }
+  });
+  return normalized;
+}
+
+function viewBelongsToRoot(
+  viewId: string,
+  rootId: string,
+  groups: LauncherGroup[],
+) {
+  const view = groups.find((group) => group.id === viewId);
+  return Boolean(
+    view
+    && (view.id === rootId && !view.parentId || view.parentId === rootId),
+  );
 }
 
 function inferKind(target: string): ItemKind {
